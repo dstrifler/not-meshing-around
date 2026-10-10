@@ -102,6 +102,8 @@ Handlers and lifecycle hooks are asynchronous; blocking I/O belongs in
 - `Job("name", interval_seconds, handler)` receives services. It first runs
   after the interval, then waits another interval after each execution.
   This first version supports intervals, not calendar/cron schedules.
+  Management enables jobs only after the transport is ready; loading and
+  `--check` never run jobs. The interval begins when jobs are enabled.
 - `start(services)` and `stop(services)` own resource setup and cleanup. Startup
   has a 10-second timeout and cleanup runs even when startup fails. Commands
   and jobs are activated only after successful startup. Job tasks are cancelled
@@ -138,6 +140,21 @@ responses; the core owns numbering and split locations. Plugin-provided split
 hints are reserved for future work.
 Transport failures are reported, without automatic retries or durable outbox
 semantics in this version.
+`core.send_timeout` (10 seconds by default) bounds waiting for the delivery lock
+and each individual transport send. Normal multipart pacing is not included in
+the per-packet timeout. A timed-out response releases the lock and records an
+error; packets already sent cannot be retracted. A cancelled or failed radio
+send marks the transport failed, preventing subsequent SDK sends from
+overlapping a still-running worker thread.
+
+Management reports transport readiness at startup and transport/plugin health
+at shutdown. Meshtastic connection-loss notifications propagate from the SDK
+thread to the core's event loop, fail the transport monitor, and trigger orderly
+shutdown with a nonzero exit. Restart the process to establish a fresh radio
+connection. Shutdown stops new work and ingress, cancels and awaits all jobs
+and inbound handlers before running plugin stop hooks, then closes transport.
+Plugin storage remains available during stop hooks. Partially initialized radio
+interfaces and event subscriptions are cleaned up even if startup fails.
 
 Exceptions in command, event, or job handlers are logged and counted in
 `Runtime.health()` with the last error. They do not stop other plugins. Command,

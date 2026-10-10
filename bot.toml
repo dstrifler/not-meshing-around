@@ -3,6 +3,8 @@ plugins = "plugins.d"
 database = "data/core.db"
 message_bytes = 160
 send_delay = 0.7
+# Maximum wait for the delivery lock or a single transport send, in seconds.
+send_timeout = 10
 
 [radio]
 # Use console for local development. For a radio, use type="tcp" with
