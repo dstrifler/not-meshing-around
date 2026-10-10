@@ -156,6 +156,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
 
         await self.runtime.activate("clock", Registration(events=(Subscription("tick", listener),),
             jobs=(Job("tick", 0.01, job),), stop=stop))
+        self.runtime.start()
         task = asyncio.create_task(self.runtime.event_loop())
         try:
             await asyncio.wait_for(fired.wait(), 1)
@@ -201,6 +202,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
             calls.append((text, kwargs))
 
         radio = MeshtasticTransport({})
+        radio.status = "ready"
         radio.interface = SimpleNamespace(myInfo=SimpleNamespace(my_node_num=42), sendText=send_text)
         radio.runtime = self.runtime
         self.runtime.transport = radio

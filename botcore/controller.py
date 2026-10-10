@@ -29,9 +29,9 @@ async def run(config_path, check=False):
         frozenset(policy_config.get("admins", [])),
         frozenset(policy_config.get("blocked", [])),
         frozenset(policy_config.get("broadcast_plugins", []))),
-        byte_limit=core.get("message_bytes", 160), send_delay=core.get("send_delay", 0.7))
+        byte_limit=core.get("message_bytes", 160), send_delay=core.get("send_delay", 0.7),
+        send_timeout=core.get("send_timeout", 10))
     tasks = []
-    started = False
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     installed_signals = []
@@ -43,7 +43,8 @@ async def run(config_path, check=False):
         if check:
             return
         await transport.start(runtime)
-        started = True
+        runtime.start()
+        print(json.dumps({"transport": transport.health()}), flush=True)
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
             installed_signals.append(sig)
@@ -55,16 +56,21 @@ async def run(config_path, check=False):
     finally:
         for sig in installed_signals:
             loop.remove_signal_handler(sig)
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        if started:
+        runtime.quiesce()
+        try:
+            await transport.stop_receiving()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             try:
-                await transport.close()
-            finally:
                 await runtime.close()
-        else:
-            await runtime.close()
+            finally:
+                # close() also cleans up resources acquired during failed start().
+                try:
+                    await transport.close()
+                finally:
+                    print(json.dumps({"transport": transport.health(), "plugins": runtime.health()}), flush=True)
 
 
 def main():
@@ -76,4 +82,4 @@ def main():
     try:
         asyncio.run(run(args.config, args.check))
     except (OSError, ValueError, RuntimeError, tomllib.TOMLDecodeError) as error:
-        parser.exit(1, f"Bot startup failed: {error}\n")
+        parser.exit(1, f"Bot failed: {error}\n")

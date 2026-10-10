@@ -34,8 +34,15 @@ def radio_message(packet, local_node, node_name=None, noise_floor=None):
 
 
 class ConsoleTransport:
+    def __init__(self):
+        self.status = "new"
+
+    def health(self):
+        return {"status": self.status, "last_error": None}
+
     async def start(self, runtime):
         self.runtime = runtime
+        self.status = "ready"
 
     async def send(self, text, destination, channel, interface):
         print(f"[{interface} channel={channel} to={destination or 'broadcast'}] {text}", flush=True)
@@ -51,8 +58,12 @@ class ConsoleTransport:
         finally:
             pipe.close()
 
-    async def close(self):
+    async def stop_receiving(self):
+        # Management cancels run(), which closes the input pipe.
         pass
+
+    async def close(self):
+        self.status = "stopped"
 
 
 class MeshtasticTransport:
@@ -61,22 +72,65 @@ class MeshtasticTransport:
         self.interface = None
         self.accepting = False
         self.pending = set()
+        self.status = "new"
+        self.last_error = None
+        self._failure = asyncio.Event()
+        self._subscriptions = []
+        self._connect_task = None
+        self._stopping = False
+
+    def health(self):
+        return {"status": self.status, "last_error": self.last_error}
 
     async def start(self, runtime):
         from pubsub import pub
         self.runtime, self.loop = runtime, asyncio.get_running_loop()
+        self.status = "starting"
         kind = self.settings.get("type")
         if kind == "tcp":
             from meshtastic.tcp_interface import TCPInterface
-            self.interface = await asyncio.to_thread(TCPInterface,
-                hostname=self.settings["hostname"], portNumber=self.settings.get("port", 4403))
+            factory = TCPInterface
+            kwargs = {"hostname": self.settings["hostname"], "portNumber": self.settings.get("port", 4403)}
         elif kind == "serial":
             from meshtastic.serial_interface import SerialInterface
-            self.interface = await asyncio.to_thread(SerialInterface, self.settings.get("device"))
+            factory, kwargs = SerialInterface, {"devPath": self.settings.get("device")}
         else:
             raise ValueError("radio type must be serial or tcp")
-        self.accepting = True
-        pub.subscribe(self.receive, "meshtastic.receive")
+        try:
+            for handler, topic in ((self.receive, "meshtastic.receive"),
+                                   (self.connection_lost, "meshtastic.connection.lost")):
+                pub.subscribe(handler, topic)
+                self._subscriptions.append((handler, topic))
+            # Retain the interface before connecting so failed handshakes can
+            # always be cleaned up, including when startup is cancelled.
+            self._connect_task = asyncio.create_task(asyncio.to_thread(self._connect, factory, kwargs))
+            await asyncio.shield(self._connect_task)
+            if self._failure.is_set():
+                raise ConnectionError(self.last_error)
+            self.status = "ready"
+            self.accepting = True
+        except Exception as error:
+            self._fail(f"radio startup failed: {error}")
+            raise
+
+    def _connect(self, factory, kwargs):
+        self.interface = factory(connectNow=False, **kwargs)
+        self.interface.connect()
+        self.interface.waitForConfig()
+        if not self.interface.isConnected.is_set() or self.interface.myInfo is None:
+            raise ConnectionError("radio did not become ready")
+
+    def connection_lost(self, interface):
+        if interface is self.interface and self.status in ("starting", "ready"):
+            self.loop.call_soon_threadsafe(self._fail, "radio connection lost")
+
+    def _fail(self, reason):
+        if self._failure.is_set():
+            return
+        self.accepting = False
+        self.status, self.last_error = "failed", reason
+        self._failure.set()
+        log.error("Radio transport failed: %s", reason)
 
     def receive(self, packet, interface):
         if not self.accepting or interface is not self.interface:
@@ -112,20 +166,55 @@ class MeshtasticTransport:
     async def send(self, text, destination, channel, interface):
         if interface != "primary":
             raise ValueError("unknown radio interface")
+        if self.status != "ready":
+            raise ConnectionError(self.last_error or "radio is not ready")
         kwargs = {"channelIndex": channel}
         if destination is not None:
             kwargs["destinationId"] = destination
-        await asyncio.to_thread(self.interface.sendText, text, **kwargs)
+        try:
+            await asyncio.to_thread(self.interface.sendText, text, **kwargs)
+        except asyncio.CancelledError:
+            # Cancelling to_thread cannot retract a running SDK send. Prevent
+            # subsequent sends from overlapping it and let management close
+            # the connection to release any blocked I/O.
+            if not self._stopping:
+                self._fail("radio send cancelled or timed out")
+            raise
+        except Exception as error:
+            self._fail(f"radio send failed: {error}")
+            raise
 
     async def run(self):
-        await asyncio.Event().wait()
+        await self._failure.wait()
+        raise ConnectionError(self.last_error)
+
+    async def stop_receiving(self):
+        self._stopping = True
+        self.accepting = False
+        tasks = list(self.pending)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def close(self):
-        from pubsub import pub
-        self.accepting = False
-        pub.unsubscribe(self.receive, "meshtastic.receive")
-        for task in list(self.pending):
-            task.cancel()
-        await asyncio.gather(*self.pending, return_exceptions=True)
+        if self.status != "failed":
+            self.status = "stopping"
+        try:
+            await self.stop_receiving()
+        finally:
+            if self._subscriptions:
+                from pubsub import pub
+                for handler, topic in self._subscriptions:
+                    pub.unsubscribe(handler, topic)
+                self._subscriptions.clear()
+            if self._connect_task:
+                # A shielded constructor/connect may still be running after
+                # cancellation; settle it before releasing its resources.
+                await asyncio.gather(self._connect_task, return_exceptions=True)
         if self.interface:
-            await asyncio.to_thread(self.interface.close)
+            try:
+                await asyncio.to_thread(self.interface.close)
+            finally:
+                self.interface = None
+        if self.status != "failed":
+            self.status = "stopped"

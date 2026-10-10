@@ -116,12 +116,17 @@ class PluginServices:
 
 
 class Runtime:
-    def __init__(self, transport, database, *, policy=None, byte_limit=160, send_delay=0.7):
+    def __init__(self, transport, database, *, policy=None, byte_limit=160, send_delay=0.7,
+                 send_timeout=10):
         chunks("", byte_limit)
         if not math.isfinite(send_delay) or send_delay < 0:
             raise ValueError("send delay must be finite and nonnegative")
+        if type(send_timeout) not in (int, float) or not math.isfinite(send_timeout) or send_timeout <= 0:
+            raise ValueError("send timeout must be finite and positive")
         self.transport, self.policy = transport, policy or Policy()
         self.byte_limit, self.send_delay = byte_limit, send_delay
+        self.send_timeout = send_timeout
+        self._running = self._closing = self._closed = False
         self.db = sqlite3.connect(database)
         self.db.execute("CREATE TABLE IF NOT EXISTS state "
                         "(plugin TEXT, key TEXT, value TEXT, PRIMARY KEY(plugin,key))")
@@ -162,6 +167,8 @@ class Runtime:
                 raise ValueError("lifecycle hooks must be async")
 
     async def activate(self, name, registration):
+        if self._closing:
+            raise RuntimeError("runtime is stopping")
         if name in self.plugins:
             raise ValueError(f"duplicate plugin: {name}")
         self.validate(registration)
@@ -174,8 +181,8 @@ class Runtime:
             for command in registration.commands:
                 for alias in (command.text, *command.aliases):
                     self.commands[alias] = (name, command)
-            for job in registration.jobs:
-                state.tasks.append(asyncio.create_task(self._job(name, job, services)))
+            if self._running:
+                self._start_jobs(name, state)
         except BaseException:
             state.status = "failed"
             if registration.stop:
@@ -185,6 +192,32 @@ class Runtime:
                     log.exception("Cleanup failed for %s", name)
             raise
 
+    def start(self):
+        """Management enables jobs only after transport startup succeeds."""
+        if self._closing:
+            raise RuntimeError("runtime is stopping")
+        if self._running:
+            return
+        self._running = True
+        for name, state in self.plugins.items():
+            if state.status == "active":
+                self._start_jobs(name, state)
+
+    def _start_jobs(self, name, state):
+        services = PluginServices(self, name)
+        for job in state.registration.jobs:
+            state.tasks.append(asyncio.create_task(self._job(name, job, services)))
+
+    def quiesce(self):
+        """Stop new work and request cancellation of all jobs before cleanup."""
+        if self._closing:
+            return
+        self._closing = True
+        self._running = False
+        for state in self.plugins.values():
+            for task in state.tasks:
+                task.cancel()
+
     def failed(self, name, error):
         state = self.plugins[name]
         state.errors += 1
@@ -192,6 +225,8 @@ class Runtime:
         log.exception("Plugin %s handler failed", name)
 
     async def dispatch(self, message):
+        if self._closing:
+            return False
         text = message.text.strip()
         # Longest command wins; matching is case insensitive and boundary aware.
         for alias in sorted(self.commands, key=len, reverse=True):
@@ -212,6 +247,8 @@ class Runtime:
         return False
 
     async def deliver(self, plugin, response, message=None):
+        if self._closing:
+            raise RuntimeError("runtime is stopping")
         if not isinstance(response, Response) or not isinstance(response.text, str):
             raise TypeError("handlers must return Response objects")
         if response.destination not in ("reply", "private", "channel"):
@@ -228,10 +265,23 @@ class Runtime:
             raise PermissionError("plugin is not permitted to broadcast or change interface")
         if not isinstance(channel, int) or isinstance(channel, bool) or not 0 <= channel <= 7:
             raise ValueError("channel must be between 0 and 7")
-        async with self.delivery_lock:
+        try:
+            async with asyncio.timeout(self.send_timeout):
+                await self.delivery_lock.acquire()
+        except TimeoutError as error:
+            raise TimeoutError("delivery queue wait timed out") from error
+        try:
+            if self._closing:
+                raise RuntimeError("runtime is stopping")
             for part in chunks(response.text, self.byte_limit):
-                await self.transport.send(part, destination, channel, interface)
+                try:
+                    async with asyncio.timeout(self.send_timeout):
+                        await self.transport.send(part, destination, channel, interface)
+                except TimeoutError as error:
+                    raise TimeoutError("transport send timed out") from error
                 await asyncio.sleep(self.send_delay)
+        finally:
+            self.delivery_lock.release()
 
     async def event_loop(self):
         while True:
@@ -255,18 +305,26 @@ class Runtime:
                 self.failed(name, error)
 
     async def close(self):
-        for name, state in reversed(list(self.plugins.items())):
-            was_active = state.status == "active"
-            if was_active:
+        if self._closed:
+            return
+        self.quiesce()
+        active = []
+        tasks = []
+        for name, state in self.plugins.items():
+            if state.status == "active":
+                active.append((name, state))
                 state.status = "stopping"
-            for task in state.tasks:
-                task.cancel()
-            await asyncio.gather(*state.tasks, return_exceptions=True)
-            if was_active and state.registration.stop:
-                try:
-                    await asyncio.wait_for(state.registration.stop(PluginServices(self, name)), 10)
-                except Exception as error:
-                    self.failed(name, error)
-            state.status = "stopped" if was_active else state.status
-        self.commands.clear()
-        self.db.close()
+            tasks.extend(state.tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            for name, state in reversed(active):
+                if state.registration.stop:
+                    try:
+                        await asyncio.wait_for(state.registration.stop(PluginServices(self, name)), 10)
+                    except Exception as error:
+                        self.failed(name, error)
+                state.status = "stopped"
+        finally:
+            self.commands.clear()
+            self.db.close()
+            self._closed = True
