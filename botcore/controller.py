@@ -5,12 +5,13 @@ import asyncio
 import json
 import logging
 import signal
+import sys
 import tomllib
 from pathlib import Path
 
 from .loader import load_plugins
-from .runtime import Policy, Runtime
-from .transport import ConsoleTransport, MeshtasticTransport
+from .runtime import CleanupError, Policy, Runtime
+from .transport import ConsoleTransport, MeshtasticTransport, validate_radio
 from .workers import positive_seconds
 
 
@@ -22,11 +23,10 @@ async def run(config_path, check=False):
     if not isinstance(core, dict) or not isinstance(radio, dict):
         raise ValueError("core and radio must be TOML tables")
     policy = Policy.from_config(config.get("policy", {}))
+    radio = validate_radio(radio)
     startup_timeout = positive_seconds(core.get("startup_timeout", 30), "core.startup_timeout")
     shutdown_timeout = positive_seconds(core.get("shutdown_timeout", 15), "core.shutdown_timeout")
-    kind = radio.get("type", "console")
-    if kind not in ("console", "tcp", "serial"):
-        raise ValueError("radio.type must be console, tcp, or serial")
+    kind = radio["type"]
     transport = ConsoleTransport() if kind == "console" else MeshtasticTransport(radio)
     database = root / core.get("database", "data/core.db")
     database.parent.mkdir(parents=True, exist_ok=True)
@@ -49,6 +49,17 @@ async def run(config_path, check=False):
     async def bounded_cleanup(awaitable):
         async with asyncio.timeout(shutdown_timeout):
             await awaitable
+
+    cleanup_failures = {}
+
+    async def cleanup_stage(name, awaitable, *, bounded=True):
+        try:
+            if bounded:
+                await bounded_cleanup(awaitable)
+            else:
+                await awaitable
+        except Exception as error:
+            cleanup_failures[name] = error
 
     try:
         # Handle termination while loading plugins or connecting the radio,
@@ -75,24 +86,31 @@ async def run(config_path, check=False):
         for task in done:
             task.result()
     finally:
+        execution_error = sys.exception()
         runtime.quiesce()
         for task in tasks:
             task.cancel()
         try:
             try:
-                await bounded_cleanup(transport.stop_receiving())
+                await cleanup_stage("ingress", transport.stop_receiving())
             finally:
                 try:
-                    await bounded_cleanup(asyncio.gather(*tasks, return_exceptions=True))
+                    await cleanup_stage("tasks", asyncio.gather(*tasks, return_exceptions=True))
                 finally:
                     try:
-                        await bounded_cleanup(runtime.close())
+                        # Runtime bounds job cancellation and each concurrent
+                        # hook; an outer deadline would prematurely skip hooks.
+                        await cleanup_stage("plugins", runtime.close(timeout=shutdown_timeout), bounded=False)
                     finally:
-                        await bounded_cleanup(transport.close())
+                        await cleanup_stage("transport", transport.close())
         finally:
             for sig in installed_signals:
                 loop.remove_signal_handler(sig)
             print(json.dumps({"transport": transport.health(), "plugins": runtime.health()}), flush=True)
+        if cleanup_failures:
+            if isinstance(execution_error, Exception):
+                cleanup_failures["execution"] = execution_error
+            raise CleanupError(cleanup_failures)
 
 
 def main():

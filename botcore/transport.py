@@ -13,6 +13,33 @@ from .workers import blocking_call, positive_seconds
 log = logging.getLogger(__name__)
 
 
+def validate_radio(settings):
+    """Validate configuration without importing the SDK or opening hardware."""
+    if not isinstance(settings, dict):
+        raise ValueError("radio must be a TOML table")
+    settings = dict(settings)
+    kind = settings.get("type", "console")
+    if kind not in ("console", "tcp", "serial"):
+        raise ValueError("radio.type must be console, tcp, or serial")
+    settings["type"] = kind
+    if kind == "tcp" or "hostname" in settings:
+        hostname = settings.get("hostname")
+        if not isinstance(hostname, str) or not hostname.strip():
+            raise ValueError("radio.hostname must be nonempty text for TCP")
+        settings["hostname"] = hostname.strip()
+    if "port" in settings:
+        port = settings["port"]
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("radio.port must be an integer from 1 to 65535")
+    if "device" in settings:
+        device = settings["device"]
+        if not isinstance(device, str) or not device.strip():
+            raise ValueError("radio.device must be nonempty text when supplied")
+    for name, default in (("connect_timeout", 20), ("close_timeout", 5)):
+        settings[name] = positive_seconds(settings.get(name, default), f"radio.{name}")
+    return settings
+
+
 def number(value):
     """Accept genuine finite radio measurements, including zero."""
     return value if type(value) in (int, float) and math.isfinite(value) else None
@@ -71,6 +98,9 @@ class ConsoleTransport:
 
 class MeshtasticTransport:
     def __init__(self, settings):
+        settings = validate_radio(settings)
+        if settings["type"] not in ("tcp", "serial"):
+            raise ValueError("Meshtastic transport requires radio.type tcp or serial")
         self.settings = settings
         self.connect_timeout = positive_seconds(settings.get("connect_timeout", 20), "radio.connect_timeout")
         self.close_timeout = positive_seconds(settings.get("close_timeout", 5), "radio.close_timeout")

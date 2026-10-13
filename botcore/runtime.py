@@ -9,9 +9,20 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 
-from .api import Command, Context, Event, EventQueueFull, Message, Registration, Response
+from .api import Command, Context, Event, EventQueueFull, Job, Message, Registration, Response, Subscription
+from .workers import positive_seconds
 
 log = logging.getLogger(__name__)
+
+
+class CleanupError(RuntimeError):
+    """Cleanup finished with failures that management must report."""
+
+    def __init__(self, failures):
+        self.failures = dict(failures)
+        details = "; ".join(f"{name}: {str(error) or type(error).__name__}"
+                            for name, error in sorted(self.failures.items()))
+        super().__init__(f"cleanup failed: {details}")
 
 
 def _payload_chunks(text: str, limit: int) -> list[str]:
@@ -103,6 +114,7 @@ class PluginState:
     errors: int = 0
     last_error: str | None = None
     tasks: list[asyncio.Task] = field(default_factory=list)
+    cleanup_error: Exception | None = None
 
 
 class PluginServices:
@@ -181,10 +193,15 @@ class Runtime:
     def validate(self, registration):
         if not isinstance(registration, Registration):
             raise TypeError("register must return Registration")
+        for field_name in ("commands", "events", "jobs"):
+            if not isinstance(getattr(registration, field_name), tuple):
+                raise TypeError(f"Registration.{field_name} must be a tuple")
         names = set()
         for command in registration.commands:
             if not isinstance(command, Command) or not inspect.iscoroutinefunction(command.handler):
                 raise ValueError("commands require async handlers")
+            if not isinstance(command.aliases, tuple):
+                raise TypeError("Command.aliases must be a tuple")
             for name in (command.text, *command.aliases):
                 if not isinstance(name, str) or not name.strip() or name != " ".join(name.lower().split()):
                     raise ValueError("command names must be normalized lowercase text")
@@ -193,12 +210,16 @@ class Runtime:
                 names.add(name)
         job_names = set()
         for job in registration.jobs:
+            if not isinstance(job, Job):
+                raise TypeError("jobs must contain Job objects")
             if not job.name or job.name in job_names or not math.isfinite(job.interval) or job.interval <= 0:
                 raise ValueError("jobs need unique names and positive finite intervals")
             job_names.add(job.name)
             if not inspect.iscoroutinefunction(job.handler):
                 raise ValueError("jobs require async handlers")
         for subscription in registration.events:
+            if not isinstance(subscription, Subscription):
+                raise TypeError("events must contain Subscription objects")
             if not subscription.event or not inspect.iscoroutinefunction(subscription.handler):
                 raise ValueError("subscriptions require named events and async handlers")
         for hook in (registration.start, registration.stop):
@@ -227,8 +248,16 @@ class Runtime:
             if registration.stop:
                 try:
                     await asyncio.wait_for(registration.stop(services), 10)
-                except Exception:
-                    log.exception("Cleanup failed for %s", name)
+                except asyncio.CancelledError:
+                    error = RuntimeError("startup cleanup cancelled")
+                    state.cleanup_error = error
+                    self.failed(name, error)
+                    raise
+                except Exception as error:
+                    if isinstance(error, TimeoutError):
+                        error = TimeoutError("startup cleanup timed out")
+                    state.cleanup_error = error
+                    self.failed(name, error)
             raise
 
     def start(self):
@@ -343,9 +372,10 @@ class Runtime:
             except Exception as error:
                 self.failed(name, error)
 
-    async def close(self):
+    async def close(self, *, timeout=10):
         if self._closed:
             return
+        timeout = positive_seconds(timeout, "runtime cleanup timeout")
         self.quiesce()
         active = []
         tasks = []
@@ -354,16 +384,44 @@ class Runtime:
                 active.append((name, state))
                 state.status = "stopping"
             tasks.extend(state.tasks)
-        try:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            for name, state in reversed(active):
+        failures = {name: state.cleanup_error for name, state in self.plugins.items()
+                    if state.cleanup_error is not None}
+
+        async def stop_plugin(name, state):
+            try:
                 if state.registration.stop:
-                    try:
-                        await asyncio.wait_for(state.registration.stop(PluginServices(self, name)), 10)
-                    except Exception as error:
-                        self.failed(name, error)
+                    async with asyncio.timeout(min(10, timeout)):
+                        await state.registration.stop(PluginServices(self, name))
+            except asyncio.CancelledError:
+                error = RuntimeError("shutdown hook cancelled")
+                failures[name] = error
+                state.cleanup_error = error
+                self.failed(name, error)
+                state.status = "failed"
+                raise
+            except Exception as error:
+                if isinstance(error, TimeoutError):
+                    error = TimeoutError("shutdown hook timed out")
+                failures[name] = error
+                state.cleanup_error = error
+                self.failed(name, error)
+                state.status = "failed"
+            else:
                 state.status = "stopped"
+
+        try:
+            try:
+                async with asyncio.timeout(timeout):
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            except TimeoutError:
+                failures["job cancellation"] = TimeoutError("job cancellation timed out")
+            # Start every hook before awaiting any one plugin. Resource cleanup
+            # is independent; jobs have stopped and namespaced storage is open.
+            hooks = [asyncio.create_task(stop_plugin(name, state)) for name, state in reversed(active)]
+            await asyncio.gather(*hooks)
         finally:
             self.commands.clear()
             self.db.close()
             self._closed = True
+        if failures:
+            raise CleanupError(failures)
