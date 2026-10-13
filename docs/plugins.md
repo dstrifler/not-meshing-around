@@ -25,6 +25,8 @@ For live operation, configure `[radio]` with `type = "tcp"`, `hostname`, and
 optional `port` (4403 by default), or `type = "serial"` and `device`. Only one
 radio named `primary` is currently supported. Live radio operation requires a
 reachable node and has not been validated with physical hardware.
+The radio adapter accepts command text addressed to the local node or the broadcast
+address only; text for other nodes, missing recipients, and local echoes is ignored.
 
 ## Layers
 
@@ -111,6 +113,11 @@ Handlers and lifecycle hooks are asynchronous; blocking I/O belongs in
 
 Services provide `get(key, default)` and `set(key, JSON_serializable_value)` in
 plugin-scoped persistent SQLite state, `emit(Event(...))`, and `send(Response(...))`.
+The event queue holds at most 256 waiting events. Emission never waits for queue
+space: it raises `botcore.api.EventQueueFull` immediately when full. Callers can
+catch that exception and drop or retry an event later. An uncaught overflow is
+reported as a handler error; other subscribers continue. This avoids a subscriber
+waiting on the same queue that the dispatcher must consume.
 For scheduled replies to a received request, use `reply(Response(...), original_message)`;
 the core retains its audience and applies delivery policy again, including
 blocked-sender checks. `services.message_bytes` exposes the core's UTF-8 byte limit.
@@ -125,6 +132,11 @@ flags. Unsolicited broadcasts, DM-to-channel responses, channel changes on
 public replies, and interface changes require the plugin ID in
 `policy.broadcast_plugins`. Direct replies to received public channel commands
 are allowed. Channel indices must be 0–7.
+`policy.admins` and `policy.blocked` must be arrays of integer node IDs from
+0 to 0xffffffff. TOML hexadecimal integers such as `0x1234abcd` are accepted;
+quoted IDs, booleans, and out-of-range values reject startup. The broadcast
+permission list must be an array of valid plugin ID strings. Policy validation
+runs before plugin initialization or database creation, including with `--check`.
 
 Delivery prefers word boundaries without dropping or reordering characters, respecting
 `core.message_bytes` as a UTF-8 byte limit. Oversized single words are split
@@ -155,6 +167,19 @@ connection. Shutdown stops new work and ingress, cancels and awaits all jobs
 and inbound handlers before running plugin stop hooks, then closes transport.
 Plugin storage remains available during stop hooks. Partially initialized radio
 interfaces and event subscriptions are cleaned up even if startup fails.
+SIGINT and SIGTERM are handled throughout plugin initialization, radio connection,
+and cleanup. `core.startup_timeout` (30 seconds) bounds initialization, while
+`core.shutdown_timeout` (15 seconds) bounds each cleanup stage independently.
+Later cleanup stages still run if an earlier one times out. Radio connection and
+cleanup also have their own `radio.connect_timeout` (20 seconds) and
+`radio.close_timeout` (5 seconds) deadlines.
+
+Blocking SDK calls run in daemon workers rather than the default executor.
+Cleanup interrupts native socket/serial I/O and stops SDK heartbeat timers before
+calling the SDK close method. A constructor or connection that finishes after
+shutdown releases its own late resources. Python cannot forcibly stop a stuck
+thread; after a deadline the bot reports failure and can exit without waiting for
+that worker. No replacement radio sends are allowed after a send failure.
 
 Exceptions in command, event, or job handlers are logged and counted in
 `Runtime.health()` with the last error. They do not stop other plugins. Command,
