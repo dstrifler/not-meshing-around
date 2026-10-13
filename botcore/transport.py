@@ -3,9 +3,12 @@
 import asyncio
 import logging
 import math
+import socket
 import sys
+import threading
 
 from .api import Event, Message
+from .workers import blocking_call, positive_seconds
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +72,8 @@ class ConsoleTransport:
 class MeshtasticTransport:
     def __init__(self, settings):
         self.settings = settings
+        self.connect_timeout = positive_seconds(settings.get("connect_timeout", 20), "radio.connect_timeout")
+        self.close_timeout = positive_seconds(settings.get("close_timeout", 5), "radio.close_timeout")
         self.interface = None
         self.accepting = False
         self.pending = set()
@@ -78,6 +83,8 @@ class MeshtasticTransport:
         self._subscriptions = []
         self._connect_task = None
         self._stopping = False
+        self._stop_worker = threading.Event()
+        self._closed = False
 
     def health(self):
         return {"status": self.status, "last_error": self.last_error}
@@ -103,22 +110,76 @@ class MeshtasticTransport:
                 self._subscriptions.append((handler, topic))
             # Retain the interface before connecting so failed handshakes can
             # always be cleaned up, including when startup is cancelled.
-            self._connect_task = asyncio.create_task(asyncio.to_thread(self._connect, factory, kwargs))
-            await asyncio.shield(self._connect_task)
+            self._connect_task = asyncio.create_task(blocking_call(self._connect, factory, kwargs))
+            self._connect_task.add_done_callback(self._connection_finished)
+            async with asyncio.timeout(self.connect_timeout):
+                await asyncio.shield(self._connect_task)
             if self._failure.is_set():
                 raise ConnectionError(self.last_error)
             self.status = "ready"
             self.accepting = True
         except Exception as error:
-            self._fail(f"radio startup failed: {error}")
+            self._fail("radio startup timed out" if isinstance(error, TimeoutError)
+                       else f"radio startup failed: {error}")
+            if isinstance(error, TimeoutError):
+                raise TimeoutError("radio startup timed out") from error
             raise
 
+    @staticmethod
+    def _connection_finished(task):
+        if not task.cancelled():
+            task.exception()  # Retrieve late failures after the startup await was cancelled.
+
     def _connect(self, factory, kwargs):
-        self.interface = factory(connectNow=False, **kwargs)
-        self.interface.connect()
-        self.interface.waitForConfig()
-        if not self.interface.isConnected.is_set() or self.interface.myInfo is None:
-            raise ConnectionError("radio did not become ready")
+        interface = factory(connectNow=False, timeout=self.connect_timeout, **kwargs)
+        self.interface = interface
+        try:
+            if self._stop_worker.is_set():
+                raise ConnectionError("radio startup stopped")
+            interface.connect()
+            if self._stop_worker.is_set():
+                raise ConnectionError("radio startup stopped")
+            if interface.waitForConfig() is False:
+                raise ConnectionError("radio configuration was not received")
+            if not interface.isConnected.is_set() or interface.myInfo is None:
+                raise ConnectionError("radio did not become ready")
+        finally:
+            # A constructor or connect that returns after the cleanup deadline
+            # still owns and releases the resources it eventually acquired.
+            if self._stop_worker.is_set():
+                try:
+                    self._interrupt_io(interface)
+                finally:
+                    interface.close()
+                    if self.interface is interface:
+                        self.interface = None
+
+    @staticmethod
+    def _interrupt_io(interface):
+        """Interrupt native I/O before the SDK attempts its own cleanup/join."""
+        interface._wantExit = True
+        timer = getattr(interface, "heartbeatTimer", None)
+        if timer:
+            timer.cancel()
+        stream = getattr(interface, "socket", None)
+        if stream:
+            try:
+                stream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            stream.close()
+            interface.socket = None
+        stream = getattr(interface, "stream", None)
+        if stream:
+            for name in ("cancel_read", "cancel_write"):
+                cancel = getattr(stream, name, None)
+                if cancel:
+                    try:
+                        cancel()
+                    except OSError:
+                        pass
+            stream.close()
+            interface.stream = None
 
     def connection_lost(self, interface):
         if interface is self.interface and self.status in ("starting", "ready"):
@@ -154,12 +215,15 @@ class MeshtasticTransport:
             if decoded.get("portnum") == "TEXT_MESSAGE_APP":
                 nodes = getattr(self.interface, "nodes", {}) or {}
                 local_node = self.interface.myInfo.my_node_num
+                if (packet.get("to") not in (local_node, 0xffffffff)
+                        or packet.get("from") == local_node):
+                    return
                 local_info = nodes.get(f"!{local_node:08x}", {})
                 name = local_info.get("user", {}).get("shortName")
                 noise = local_info.get("localStats", {}).get("noiseFloor")
                 await self.runtime.dispatch(radio_message(packet, local_node, name, noise))
             else:
-                await self.runtime.events.put(Event("radio.packet", packet))
+                self.runtime.enqueue_event(Event("radio.packet", packet))
         except Exception:
             log.exception("Unable to process radio packet")
 
@@ -172,9 +236,9 @@ class MeshtasticTransport:
         if destination is not None:
             kwargs["destinationId"] = destination
         try:
-            await asyncio.to_thread(self.interface.sendText, text, **kwargs)
+            await blocking_call(self.interface.sendText, text, **kwargs)
         except asyncio.CancelledError:
-            # Cancelling to_thread cannot retract a running SDK send. Prevent
+            # Cancelling an await cannot retract a running SDK send. Prevent
             # subsequent sends from overlapping it and let management close
             # the connection to release any blocked I/O.
             if not self._stopping:
@@ -197,24 +261,38 @@ class MeshtasticTransport:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def close(self):
+        if self._closed:
+            return
+        self._stopping = True
+        self._stop_worker.set()
         if self.status != "failed":
             self.status = "stopping"
         try:
-            await self.stop_receiving()
-        finally:
+            # Unsubscribe before any await, including cleanup that may time out.
             if self._subscriptions:
                 from pubsub import pub
                 for handler, topic in self._subscriptions:
                     pub.unsubscribe(handler, topic)
                 self._subscriptions.clear()
-            if self._connect_task:
-                # A shielded constructor/connect may still be running after
-                # cancellation; settle it before releasing its resources.
-                await asyncio.gather(self._connect_task, return_exceptions=True)
-        if self.interface:
-            try:
-                await asyncio.to_thread(self.interface.close)
-            finally:
-                self.interface = None
+            async with asyncio.timeout(self.close_timeout):
+                await self.stop_receiving()
+                if self.interface:
+                    try:
+                        await blocking_call(self._interrupt_io, self.interface)
+                    except Exception:
+                        log.warning("Native radio I/O interruption failed; attempting SDK cleanup", exc_info=True)
+                if self._connect_task:
+                    await asyncio.shield(asyncio.gather(self._connect_task, return_exceptions=True))
+                if self.interface:
+                    await blocking_call(self.interface.close)
+        except TimeoutError as error:
+            self._fail("radio cleanup timed out")
+            raise TimeoutError("radio cleanup timed out") from error
+        except Exception as error:
+            self._fail(f"radio cleanup failed: {error}")
+            raise
+        finally:
+            self._closed = True
+            self.interface = None
         if self.status != "failed":
             self.status = "stopped"

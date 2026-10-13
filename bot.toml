@@ -5,13 +5,20 @@ message_bytes = 160
 send_delay = 0.7
 # Maximum wait for the delivery lock or a single transport send, in seconds.
 send_timeout = 10
+# Deadline for initialization and maximum wait per cleanup stage.
+startup_timeout = 30
+shutdown_timeout = 15
 
 [radio]
 # Use console for local development. For a radio, use type="tcp" with
 # hostname="your-node" and port=4403, or type="serial" with device="/dev/ttyACM0".
 type = "console"
+# Deadlines for radio connection and cleanup; used by TCP and serial transports.
+connect_timeout = 20
+close_timeout = 5
 
 [policy]
+# Node IDs are integers (TOML hex integers such as 0x1234abcd are supported).
 admins = []
 blocked = []
 # Plugins allowed to send unsolicited channel messages or change reply audience.

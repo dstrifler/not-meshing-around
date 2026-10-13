@@ -5,10 +5,11 @@ import inspect
 import json
 import logging
 import math
+import re
 import sqlite3
 from dataclasses import dataclass, field
 
-from .api import Command, Context, Event, Message, Registration, Response
+from .api import Command, Context, Event, EventQueueFull, Message, Registration, Response
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +61,35 @@ class Policy:
     blocked: frozenset[int] = frozenset()
     broadcast_plugins: frozenset[str] = frozenset()
 
+    def __post_init__(self):
+        for name in ("admins", "blocked"):
+            if any(type(node) is not int or not 0 <= node <= 0xffffffff
+                   for node in getattr(self, name)):
+                raise ValueError(f"policy.{name} requires integer node IDs from 0 to 0xffffffff")
+        if any(not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", name)
+               for name in self.broadcast_plugins):
+            raise ValueError("policy.broadcast_plugins requires valid plugin IDs")
+
+    @classmethod
+    def from_config(cls, config):
+        if not isinstance(config, dict):
+            raise ValueError("policy must be a TOML table")
+        values = []
+        for name in ("admins", "blocked", "broadcast_plugins"):
+            entries = config.get(name, [])
+            if not isinstance(entries, list):
+                raise ValueError(f"policy.{name} must be an array")
+            # Validate before making a set: bools compare equal to integer IDs,
+            # and malformed entries may be unhashable.
+            if name == "broadcast_plugins":
+                if any(not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", item)
+                       for item in entries):
+                    raise ValueError("policy.broadcast_plugins requires valid plugin IDs")
+            elif any(type(item) is not int or not 0 <= item <= 0xffffffff for item in entries):
+                raise ValueError(f"policy.{name} requires integer node IDs from 0 to 0xffffffff")
+            values.append(frozenset(entries))
+        return cls(*values)
+
     def allows(self, message: Message, command: Command) -> bool:
         return (message.sender not in self.blocked
                 and (not command.admin_only or message.sender in self.admins)
@@ -105,9 +135,7 @@ class PluginServices:
     async def emit(self, event):
         if self._runtime.plugins[self._plugin].status != "active":
             raise RuntimeError("plugin is not active")
-        if not isinstance(event, Event) or not event.name:
-            raise ValueError("emit requires a named Event")
-        await self._runtime.events.put(event)
+        self._runtime.enqueue_event(event)
 
     async def send(self, response):
         if self._runtime.plugins[self._plugin].status != "active":
@@ -138,6 +166,17 @@ class Runtime:
         return {name: {"status": state.status, "errors": state.errors,
                        "last_error": state.last_error}
                 for name, state in self.plugins.items()}
+
+    def enqueue_event(self, event):
+        """Never wait on the queue whose consumer may be the calling handler."""
+        if self._closing:
+            raise RuntimeError("runtime is stopping")
+        if not isinstance(event, Event) or not isinstance(event.name, str) or not event.name:
+            raise ValueError("emit requires a named Event")
+        try:
+            self.events.put_nowait(event)
+        except asyncio.QueueFull as error:
+            raise EventQueueFull("event queue is full") from error
 
     def validate(self, registration):
         if not isinstance(registration, Registration):
@@ -315,8 +354,8 @@ class Runtime:
                 active.append((name, state))
                 state.status = "stopping"
             tasks.extend(state.tasks)
-        await asyncio.gather(*tasks, return_exceptions=True)
         try:
+            await asyncio.gather(*tasks, return_exceptions=True)
             for name, state in reversed(active):
                 if state.registration.stop:
                     try:

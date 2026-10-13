@@ -87,8 +87,10 @@ class RuntimeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("botcore.runtime", level="ERROR"):
             first = asyncio.create_task(self.runtime.dispatch(Message("echo hang", 1, direct=True)))
             await asyncio.wait_for(entered.wait(), 1)
-            second = asyncio.create_task(self.runtime.dispatch(Message("echo ok", 2, direct=True)))
-            await asyncio.wait_for(asyncio.gather(first, second), 1)
+            await asyncio.wait_for(first, 1)
+        # Queue deadlines are tested separately. Prove a failed send releases
+        # the lock before starting the next request, without racing deadlines.
+        await asyncio.wait_for(self.runtime.dispatch(Message("echo ok", 2, direct=True)), 1)
         self.assertEqual(self.sent, ["ok"])
         self.assertFalse(self.runtime.delivery_lock.locked())
         self.assertEqual(self.runtime.health()["echo"]["errors"], 1)
@@ -297,6 +299,102 @@ class RadioLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.radio._enqueue(packet)
         self.assertFalse(self.radio.pending)
 
+    async def test_text_commands_only_accept_local_or_broadcast_recipients(self):
+        received = []
+
+        async def dispatch(message):
+            received.append(message)
+
+        await self.radio.start(SimpleNamespace(dispatch=dispatch))
+        for recipient, sender in ((42, 123), (0xffffffff, 123), (456, 123),
+                                  (None, 123), (42, 42), (0xffffffff, 42)):
+            await self.radio._handle({"from": sender, "to": recipient,
+                "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"ping"}})
+        self.assertEqual(len(received), 2)
+        self.assertTrue(received[0].direct)
+        self.assertFalse(received[1].direct)
+
+    async def test_connection_and_cleanup_deadlines_do_not_wait_for_stuck_worker(self):
+        release = threading.Event()
+
+        def connect():
+            release.wait()
+            self.interface.isConnected.set()
+
+        self.interface.connect = connect
+        self.radio.connect_timeout = self.radio.close_timeout = 0.02
+        try:
+            with self.assertLogs("botcore.transport", level="ERROR"):
+                with self.assertRaisesRegex(TimeoutError, "startup timed out"):
+                    await asyncio.wait_for(self.radio.start(SimpleNamespace()), 1)
+            with self.assertRaisesRegex(TimeoutError, "cleanup timed out"):
+                await asyncio.wait_for(self.radio.close(), 1)
+            self.assertFalse(self.interface.closed)
+            release.set()
+            await asyncio.gather(self.radio._connect_task, return_exceptions=True)
+            self.assertTrue(self.interface.closed)
+            self.assertTrue(all(not listeners for listeners in self.pub.listeners.values()))
+        finally:
+            release.set()
+
+    async def test_late_constructor_releases_interface_after_cleanup_deadline(self):
+        release = threading.Event()
+
+        def factory(**kwargs):
+            release.wait()
+            return self.interface
+
+        self.radio.connect_timeout = self.radio.close_timeout = 0.02
+        try:
+            with patch.object(sys.modules["meshtastic.tcp_interface"], "TCPInterface", factory):
+                with self.assertLogs("botcore.transport", level="ERROR"):
+                    with self.assertRaises(TimeoutError):
+                        await asyncio.wait_for(self.radio.start(SimpleNamespace()), 1)
+                with self.assertRaises(TimeoutError):
+                    await asyncio.wait_for(self.radio.close(), 1)
+                release.set()
+                await asyncio.gather(self.radio._connect_task, return_exceptions=True)
+            self.assertTrue(self.interface.closed)
+            self.assertFalse(self.interface.isConnected.is_set())
+            self.assertIsNone(self.radio.interface)
+        finally:
+            release.set()
+
+    async def test_sdk_close_has_its_own_deadline(self):
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def close():
+            entered.set()
+            release.wait()
+            finished.set()
+
+        await self.radio.start(SimpleNamespace())
+        self.interface.close = close
+        self.radio.close_timeout = 0.02
+        try:
+            with self.assertLogs("botcore.transport", level="ERROR"):
+                with self.assertRaisesRegex(TimeoutError, "cleanup timed out"):
+                    await asyncio.wait_for(self.radio.close(), 1)
+            self.assertTrue(entered.is_set())
+            self.assertFalse(finished.is_set())
+            self.assertEqual(self.radio.health()["status"], "failed")
+        finally:
+            release.set()
+
+    def test_native_io_is_interrupted_before_sdk_close(self):
+        from unittest.mock import Mock
+        interface = SimpleNamespace(socket=Mock(), stream=Mock(), heartbeatTimer=Mock())
+        sock, stream, timer = interface.socket, interface.stream, interface.heartbeatTimer
+        self.radio._interrupt_io(interface)
+        sock.shutdown.assert_called_once()
+        sock.close.assert_called_once()
+        stream.cancel_read.assert_called_once()
+        stream.cancel_write.assert_called_once()
+        stream.close.assert_called_once()
+        timer.cancel.assert_called_once()
+        self.assertIsNone(interface.socket)
+        self.assertIsNone(interface.stream)
+
 
 class ManagementLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -396,6 +494,32 @@ class ManagementLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.transport.job_fired.is_set())
         self.assertNotIn("transport.start", self.trace)
         self.assertEqual(self.trace, ["ingress.stop", "plugin.stop", "transport.close"])
+
+    async def test_startup_deadline_still_cleans_up(self):
+        entered = asyncio.Event()
+
+        async def start(runtime):
+            entered.set()
+            await asyncio.Event().wait()
+
+        self.transport.start = start
+        self.config.write_text('[core]\nstartup_timeout=0.04\n[radio]\ntype="console"\n')
+        with self.assertRaisesRegex(TimeoutError, "startup timed out"):
+            await self.run_controller()
+        self.assertTrue(entered.is_set())
+        self.assertTrue(self.transport.closed)
+        self.assertEqual(self.runtime.health()["p"]["status"], "stopped")
+
+    async def test_ingress_timeout_does_not_skip_remaining_cleanup(self):
+        async def stop_receiving():
+            await asyncio.Event().wait()
+
+        self.transport.stop_receiving = stop_receiving
+        self.config.write_text('[core]\nshutdown_timeout=0.03\n[radio]\ntype="console"\n')
+        with self.assertRaises(TimeoutError):
+            await self.run_controller()
+        self.assertTrue(self.transport.closed)
+        self.assertEqual(self.runtime.health()["p"]["status"], "stopped")
 
 
 if __name__ == "__main__":

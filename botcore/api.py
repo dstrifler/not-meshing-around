@@ -34,6 +34,10 @@ class Event:
     data: Mapping[str, Any] = field(default_factory=dict)
 
 
+class EventQueueFull(RuntimeError):
+    """The core cannot accept another event; callers may retry or drop it."""
+
+
 class Services(Protocol):
     @property
     def message_bytes(self) -> int: ...
