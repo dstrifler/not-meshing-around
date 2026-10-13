@@ -27,6 +27,11 @@ radio named `primary` is currently supported. Live radio operation requires a
 reachable node and has not been validated with physical hardware.
 The radio adapter accepts command text addressed to the local node or the broadcast
 address only; text for other nodes, missing recipients, and local echoes is ignored.
+Radio settings are validated before plugin loading and database creation, including
+with `--check`. TCP requires a nonempty `hostname`; `port`, when supplied, must be
+an integer from 1 to 65535. Serial `device`, when supplied, must be nonempty text;
+omitting it retains SDK device autodetection. These checks do not import the SDK
+or open hardware, and do not test whether the configured node is reachable.
 
 ## Layers
 
@@ -87,6 +92,9 @@ hooks, so those hooks should avoid irreversible actions.
 
 Import public types from `botcore.api`. `register(settings)` is synchronous and
 returns a `Registration`. It should only validate settings and construct handlers.
+The `commands`, `events`, and `jobs` fields, and each command's `aliases`, must be
+tuples. Lists, generators, and other containers are rejected before initialization;
+invalid registrations never receive partial command registrations.
 Handlers and lifecycle hooks are asynchronous; blocking I/O belongs in
 `asyncio.to_thread`, or an asynchronous client.
 
@@ -110,6 +118,10 @@ Handlers and lifecycle hooks are asynchronous; blocking I/O belongs in
   has a 10-second timeout and cleanup runs even when startup fails. Commands
   and jobs are activated only after successful startup. Job tasks are cancelled
   before shutdown hooks. Hooks must make cleanup safe after partial startup.
+  Stop hooks run concurrently after all job cancellation completes, so they must
+  own their resources independently and must not depend on another plugin's
+  teardown order. Each hook has its own timeout, capped at 10 seconds and further
+  limited by `core.shutdown_timeout`; every active plugin gets an attempt.
 
 Services provide `get(key, default)` and `set(key, JSON_serializable_value)` in
 plugin-scoped persistent SQLite state, `emit(Event(...))`, and `send(Response(...))`.
@@ -173,6 +185,14 @@ and cleanup. `core.startup_timeout` (30 seconds) bounds initialization, while
 Later cleanup stages still run if an earlier one times out. Radio connection and
 cleanup also have their own `radio.connect_timeout` (20 seconds) and
 `radio.close_timeout` (5 seconds) deadlines.
+Runtime job cancellation and concurrent stop hooks have separate cleanup budgets.
+A failed or timed-out stop hook leaves its plugin marked `failed`, records the
+error, and allows other hooks to finish with storage still available. Storage is closed and
+transport cleanup is attempted before aggregated cleanup errors reach management. Failed
+cleanup makes normal shutdown and `--check` exit nonzero; failures in multiple
+cleanup stages are included in the error report.
+Errors releasing resources after failed or cancelled initialization are also
+retained for management, even when that plugin never became active.
 
 Blocking SDK calls run in daemon workers rather than the default executor.
 Cleanup interrupts native socket/serial I/O and stops SDK heartbeat timers before

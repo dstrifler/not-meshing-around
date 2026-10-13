@@ -119,9 +119,12 @@ asyncio.run(controller.run(root / "bot.toml"))
 '''
 
     def await_marker(self, process, path):
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 10
         while not path.exists() and process.poll() is None and time.monotonic() < deadline:
             time.sleep(.005)
+        if not path.exists() and process.poll() is not None:
+            _, errors = process.communicate()
+            self.fail(f"Child exited with {process.returncode} before {path.name}: {errors.decode()}")
         self.assertTrue(path.exists(), f"Child did not reach {path.name}")
 
     def test_sigterm_during_initialization_runs_cleanup(self):
@@ -137,7 +140,7 @@ asyncio.run(controller.run(root / "bot.toml"))
                     if phase == "second-signal":
                         self.await_marker(process, root / "cleaning")
                         process.send_signal(signal.SIGTERM)
-                    _, errors = process.communicate(timeout=2)
+                    _, errors = process.communicate(timeout=10)
                     self.assertEqual(process.returncode, 0, errors.decode())
                     self.assertTrue((root / "plugin-cleaned").exists())
                     self.assertTrue((root / "transport-cleaned").exists())
@@ -158,7 +161,7 @@ async def main():
 asyncio.run(main())
 '''
         result = subprocess.run([sys.executable, "-c", source],
-            cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=2)
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
 
 

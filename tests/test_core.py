@@ -201,7 +201,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         def send_text(text, **kwargs):
             calls.append((text, kwargs))
 
-        radio = MeshtasticTransport({})
+        radio = MeshtasticTransport({"type": "tcp", "hostname": "test"})
         radio.status = "ready"
         radio.interface = SimpleNamespace(myInfo=SimpleNamespace(my_node_num=42), sendText=send_text)
         radio.runtime = self.runtime

@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from botcore import controller
 from botcore.api import Command, Job, Message, Registration, Response
-from botcore.runtime import PluginServices, Runtime
+from botcore.runtime import CleanupError, PluginServices, Runtime
 from botcore.transport import MeshtasticTransport
 
 
@@ -516,10 +516,74 @@ class ManagementLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.transport.stop_receiving = stop_receiving
         self.config.write_text('[core]\nshutdown_timeout=0.03\n[radio]\ntype="console"\n')
-        with self.assertRaises(TimeoutError):
+        with self.assertRaisesRegex(CleanupError, "ingress"):
             await self.run_controller()
         self.assertTrue(self.transport.closed)
         self.assertEqual(self.runtime.health()["p"]["status"], "stopped")
+
+    async def test_hook_failure_propagates_after_transport_cleanup(self):
+        async def load(runtime, directory):
+            self.runtime = runtime
+
+            async def stop(services):
+                raise OSError("hook cleanup failed")
+
+            await runtime.activate("broken", Registration(stop=stop))
+            return {"broken": {"status": "active"}}
+
+        with patch.object(self, "load", load), self.assertLogs("botcore.runtime", level="ERROR"):
+            with self.assertRaisesRegex(CleanupError, "hook cleanup failed"):
+                await self.run_controller(check=True)
+        self.assertTrue(self.transport.closed)
+        self.assertEqual(self.runtime.health()["broken"]["status"], "failed")
+
+    async def test_multiple_cleanup_failures_are_all_reported(self):
+        async def load(runtime, directory):
+            self.runtime = runtime
+
+            async def stop(services):
+                raise OSError("hook cleanup failed")
+
+            await runtime.activate("broken", Registration(stop=stop))
+            return {"broken": {"status": "active"}}
+
+        async def close():
+            self.transport.closed = True
+            raise OSError("transport cleanup failed")
+
+        self.transport.close = close
+        with patch.object(self, "load", load), self.assertLogs("botcore.runtime", level="ERROR"):
+            with self.assertRaises(CleanupError) as caught:
+                await self.run_controller(check=True)
+        self.assertEqual(set(caught.exception.failures), {"plugins", "transport"})
+        self.assertIn("hook cleanup failed", str(caught.exception))
+        self.assertIn("transport cleanup failed", str(caught.exception))
+        self.assertTrue(self.transport.closed)
+
+    async def test_each_hook_gets_its_own_budget_instead_of_a_shared_deadline(self):
+        calls = []
+
+        async def load(runtime, directory):
+            self.runtime = runtime
+
+            async def fast(services):
+                calls.append("fast")
+
+            async def slow(services):
+                calls.append("slow")
+                await asyncio.Event().wait()
+
+            await runtime.activate("first", Registration(stop=fast))
+            await runtime.activate("last", Registration(stop=slow))
+            return {name: {"status": "active"} for name in runtime.plugins}
+
+        self.config.write_text('[core]\nshutdown_timeout=0.05\n[radio]\ntype="console"\n')
+        with patch.object(self, "load", load), self.assertLogs("botcore.runtime", level="ERROR"):
+            with self.assertRaisesRegex(CleanupError, "shutdown hook timed out"):
+                await self.run_controller(check=True)
+        self.assertCountEqual(calls, ["fast", "slow"])
+        self.assertEqual(self.runtime.health()["first"]["status"], "stopped")
+        self.assertTrue(self.transport.closed)
 
 
 if __name__ == "__main__":
