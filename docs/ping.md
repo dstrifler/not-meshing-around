@@ -19,6 +19,11 @@ no original feature modules or installation changes are required.
 | `ping #Field test` | Label the response; counted requests can also include a label. |
 | `ping @ABCD` | Label the reply and emit `ping.mention_requested` for future integration. |
 
+Core normalizes known node names, short names, and node numbers to `@!xxxxxxxx`
+before ping receives them and before responses are sent. Unknown or ambiguous
+tags remain unchanged. See [node mentions](plugins.md#node-mentions).
+The mention remains a label; it does not change the reply's recipient.
+
 ## Configuration
 
 `plugins.d/ping.toml` supplies these settings:

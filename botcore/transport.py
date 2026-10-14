@@ -3,11 +3,13 @@
 import asyncio
 import logging
 import math
+import re
 import socket
 import sys
 import threading
 
 from .api import Event, Message
+from .mentions import NodeIdentity, valid_number
 from .workers import blocking_call, positive_seconds
 
 log = logging.getLogger(__name__)
@@ -70,6 +72,11 @@ class ConsoleTransport:
     def health(self):
         return {"status": self.status, "last_error": None}
 
+    def node_snapshot(self, interface="primary"):
+        if interface != "primary":
+            raise ValueError("unknown radio interface")
+        return ()
+
     async def start(self, runtime):
         self.runtime = runtime
         self.status = "ready"
@@ -118,6 +125,29 @@ class MeshtasticTransport:
 
     def health(self):
         return {"status": self.status, "last_error": self.last_error}
+
+    def node_snapshot(self, interface="primary"):
+        """Copy identity data from the SDK's live node database, without I/O."""
+        if interface != "primary":
+            raise ValueError("unknown radio interface")
+        nodes = getattr(self.interface, "nodes", None) or {}
+        if not isinstance(nodes, dict):
+            return ()
+        result = []
+        for key, value in list(nodes.items()):
+            if not isinstance(value, dict):
+                continue
+            user = value.get("user")
+            user = dict(user) if isinstance(user, dict) else {}
+            number = value.get("num")
+            keyed = int(key[1:], 16) if isinstance(key, str) and re.fullmatch(r"![0-9a-fA-F]{8}", key) else None
+            if not valid_number(number):
+                number = keyed
+            elif keyed is not None and keyed != number:
+                continue
+            if valid_number(number):
+                result.append(NodeIdentity(number, user.get("longName", ""), user.get("shortName", "")))
+        return tuple(result)
 
     async def start(self, runtime):
         from pubsub import pub
