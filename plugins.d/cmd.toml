@@ -1,0 +1,5 @@
+[plugin]
+id = "cmd"
+version = "1.0.0"
+api_version = 1
+enabled = true

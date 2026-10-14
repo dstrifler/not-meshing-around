@@ -1,7 +1,7 @@
 # Plugin runtime
 
 The new runtime has one entry point, `mesh_bot.py`. Its features come entirely from
-paired files in `plugins.d`; a ping-only installation enables only `ping.toml`.
+paired files in `plugins.d`; `cmd.toml` and `ping.toml` are enabled by default.
 The original implementation is preserved under `integration/` for future plugin
 ports. It is not a supported runnable bot or a dependency of the new runtime.
 
@@ -108,6 +108,9 @@ Handlers and lifecycle hooks are asynchronous; blocking I/O belongs in
   Return a `Response`, a list of responses, or `None`.
 - `Response(text)` replies to the incoming audience. `destination="private"`
   replies to the sender. `destination="channel"` targets a channel.
+  Text normally uses core mention normalization and automatic byte splitting.
+  `normalize_mentions=False` preserves literal command names or other text that
+  must not be interpreted as mentions.
 - `Subscription("event.name", handler)` receives `(Event, services)`.
   Services can emit custom events. Non-text radio packets currently emit
   `radio.packet` with the decoded packet dictionary; additional normalized
@@ -142,11 +145,32 @@ waiting on the same queue that the dispatcher must consume.
 For scheduled replies to a received request, use `reply(Response(...), original_message)`;
 the core retains its audience and applies delivery policy again, including
 blocked-sender checks. `services.message_bytes` exposes the core's UTF-8 byte limit.
+`services.command_names(message)` returns an immutable, alphabetically sorted tuple
+of active primary command names allowed for that message by core policy. Aliases,
+command-free plugins, rejected/disabled plugins, and inactive registrations are
+omitted. Admin-only and DM-only commands are filtered for the requesting sender
+and audience; blocked senders get no names. The result reflects the live registry
+at the time of the call and exposes no handler objects.
+
+Plugins that need repeated headers or whole entries in each packet can plan
+their own pages. `services.packet_payload_bytes(packet_count)` gives the maximum
+body bytes after reserving core's widest `[n/x] ` prefix; one packet has no prefix.
+Count the repeated header, newlines, and each entry in UTF-8 bytes. Pack the entries,
+then recalculate with the resulting packet count until it stabilizes, since 10
+or 100 packets need wider numbering. Return `Response(tuple_of_packet_bodies)`.
+Core adds numbering, validates every final packet against `core.message_bytes`,
+and transmits the complete response under its usual delivery lock and policy.
+Preplanned packets are not split again: an oversized page fails before any send.
+Empty tuples, empty/non-text bodies, and non-positive/non-integer planned counts
+are rejected. Normal mention normalization still applies unless explicitly
+disabled; its expansion can also make a page fail validation. See
+[cmd.md](cmd.md) for an implementation that preserves literal command spellings.
+
 Emission and sending require an active plugin, so startup/shutdown hooks should
 focus on resource management. Jobs and event handlers have no implicit reply
 recipient: sending requires `destination="channel"` and an explicit channel.
 Alternatively, retain the originating message and use `reply` for solicited
-delayed responses. See [ping.md](ping.md) for the first feature migration.
+delayed responses. See [ping.md](ping.md) for the diagnostics feature migration.
 
 Core policy applies blocked node IDs and command `admin_only`/`direct_only`
 flags. Unsolicited broadcasts, DM-to-channel responses, channel changes on
@@ -203,8 +227,10 @@ not guessed. The longest matching known name takes precedence; an ambiguous
 longest name is left unchanged. No name discovery or lookup over the mesh occurs.
 Console transport has no node database, so its tags stay unchanged.
 
-Normalization applies to command-handler input and every outgoing response,
-including delayed replies and messages from jobs/events. Each pass uses a fresh
+Normalization applies to command-handler input and outgoing responses by default,
+including delayed replies and messages from jobs/events. A response containing
+literal command spellings can opt out with `normalize_mentions=False`.
+Each pass uses a fresh
 identity snapshot so renames are reflected on the next message. Command routing
 uses the original command spelling. `Message.original_text` preserves the input;
 sender, channel, interface, and reply audience retain their normal meanings.
@@ -234,8 +260,8 @@ responses; the core owns numbering and split locations. Node-ID mentions remain
 whole within a packet. If a mention cannot fit alongside the numbering prefix,
 the complete response fails before sending any packets. Longer malformed hex
 tokens also remain whole, preventing a split from creating an accidental valid
-mention. Plugin-provided split
-hints are reserved for future work.
+mention. Preplanned response bodies use the explicit pagination contract described
+above.
 Transport failures are reported, without automatic retries or durable outbox
 semantics in this version.
 `core.send_timeout` (10 seconds by default) bounds waiting for the delivery lock
