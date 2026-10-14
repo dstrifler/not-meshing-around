@@ -418,7 +418,10 @@ class Runtime:
             # Start every hook before awaiting any one plugin. Resource cleanup
             # is independent; jobs have stopped and namespaced storage is open.
             hooks = [asyncio.create_task(stop_plugin(name, state)) for name, state in reversed(active)]
-            await asyncio.gather(*hooks)
+            # A hook can propagate cancellation from its own child task. Wait
+            # for all hooks before closing storage and reporting their failures.
+            # Cancelling close() itself still cancels this gather and propagates.
+            await asyncio.gather(*hooks, return_exceptions=True)
         finally:
             self.commands.clear()
             self.db.close()
