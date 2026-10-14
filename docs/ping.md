@@ -30,6 +30,8 @@ The mention remains a label; it does not change the reply's recipient.
 
 - `reply`: configured ping response; default `🏓 Pong.`
 - `reply_privately`: default true, including replies to public-channel requests.
+- `show_noise_floor`: default false; include the bot's available local noise floor
+  for confirmed direct RF requests only.
 - `interval_seconds`: default 20, permitted range 1–3600 seconds.
 - `max_count`: default 50, permitted range 2–50 replies.
 - `max_sessions`: default 2, permitted range 1–8 concurrent sequences.
@@ -51,12 +53,30 @@ previous delivery. Core pacing and congestion can delay replies. `stop` prevents
 future replies but cannot recall a packet already being transmitted. Delivery
 failure removes the affected sequence and is reported in core health/logs.
 
-Diagnostics use normalized transport metadata: SNR in dB, RSSI and noise floor
-in dBm, hop count, MQTT route, and local short name. Missing measurements are
-omitted; zero is a valid measurement. Hop count is derived only from valid
-`hopStart`/`hopLimit` fields; it is not guessed when they are absent. Noise floor
-is included only when provided by the transport's local node data. Console
-requests have no invented radio readings.
+Diagnostics use the received request's normalized transport metadata:
+
+| Request route | Example ping response |
+| --- | --- |
+| Confirmed direct RF (zero hops, no MQTT/gateway indication) | `🏓 Pong. Direct RF. SNR: 7.5 dB. RSSI: -85 dBm.` |
+| Relayed | `🏓 Pong. Hops: 2.` |
+| MQTT reported | `🏓 Pong. Hops: 2. MQTT.` |
+| MQTT reported, hops unavailable | `🏓 Pong. Hops: unknown. MQTT.` |
+| Gateway reported | `🏓 Pong. Hops: 2. Gateway.` |
+| Hops unavailable | `🏓 Pong. Hops: unknown.` |
+
+SNR and RSSI on relayed packets describe the last RF link into the bot, so they
+are omitted for indirect, MQTT, gateway, and unknown-hop requests. Missing or
+non-finite direct-link readings are omitted; zero is valid. Optional noise floor
+is a local bot measurement in dBm and follows the same direct-RF restriction.
+Hop count comes only from valid `hopStart`/`hopLimit` fields; DM addressing does
+not prove a direct RF link. MQTT is tagged when reported by normalized packet
+metadata; absence of the tag does not establish an entirely RF route. Core cannot
+reconstruct unreported MQTT segments. Console requests show unknown hops without
+invented RF readings.
+
+Automatic diagnostic replies use the original request's measurements and route;
+they do not measure new RF conditions or round-trip time. Reply counts and
+buffer-test byte sizes retain their existing output.
 
 ## Text conventions and migration decisions
 

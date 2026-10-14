@@ -192,7 +192,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         report = await load_plugins(self.runtime, Path(__file__).resolve().parents[1] / "plugins.d")
         self.assertEqual(report["ping"]["status"], "active")
         await self.runtime.dispatch(Message("ping", 123, direct=True))
-        self.assertEqual("".join(item[0] for item in self.transport.sent), "🏓 Pong.")
+        self.assertEqual(payloads([item[0] for item in self.transport.sent]), "🏓 Pong. Hops: unknown.")
         self.assertEqual(PluginServices(self.runtime, "ping").get("requests"), 1)
 
     async def test_radio_adapter_normalizes_packets_and_delivery(self):
@@ -209,7 +209,7 @@ class CoreTests(unittest.IsolatedAsyncioTestCase):
         await load_plugins(self.runtime, Path(__file__).resolve().parents[1] / "plugins.d")
         await radio._handle({"from": 123, "to": 42, "channel": 2,
                              "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"ping"}})
-        self.assertEqual("".join(text for text, _ in calls), "🏓 Pong.")
+        self.assertEqual(payloads([text for text, _ in calls]), "🏓 Pong. Hops: unknown.")
         self.assertTrue(all(kwargs == {"channelIndex": 2, "destinationId": 123} for _, kwargs in calls))
         calls.clear()
         await radio._handle({"from": 123, "to": 0xffffffff, "channel": 2,
