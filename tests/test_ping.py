@@ -64,16 +64,51 @@ class PingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.request('ping', 'help')).text, ping.HELP)
 
     async def test_diagnostics_have_units_and_keep_zero(self):
-        text = (await self.request(snr=0, rssi=-85, noise_floor=-110, hops=1)).text
-        self.assertIn('Route: 1 hop.', text)
+        text = (await self.request(snr=0, rssi=-85, noise_floor=-110, hops=0, direct=False)).text
+        self.assertIn('Direct RF.', text)
         self.assertIn('SNR: 0 dB.', text)
         self.assertIn('RSSI: -85 dBm.', text)
-        self.assertIn('Noise floor: -110 dBm.', text)
-        self.assertIn('Route: direct RF.', (await self.request(hops=0)).text)
-        self.assertIn('Route: MQTT.', (await self.request(hops=2, via_mqtt=True)).text)
-        self.assertIn('Route: gateway.', (await self.request(transport='gateway')).text)
-        self.assertNotIn('SNR', (await self.request(snr=float('nan'))).text)
+        self.assertNotIn('Noise floor', text)
+        for invalid in (float('nan'), float('inf'), True):
+            self.assertEqual((await self.request(hops=0, snr=invalid, rssi=invalid)).text,
+                             '🏓 Pong. Direct RF.')
         self.assertIn('This is K7MHI.', (await self.request('cq', node_name='K7MHI')).text)
+
+    async def test_indirect_mqtt_and_unknown_routes_omit_rf_readings(self):
+        self.registration = ping.register({'show_noise_floor': True})
+        cases = [({'hops': 2}, 'Hops: 2.'),
+                 ({'hops': 1}, 'Hops: 1.'),
+                 ({'hops': 2, 'via_mqtt': True}, 'Hops: 2. MQTT.'),
+                 ({'hops': 0, 'via_mqtt': True}, 'Hops: 0. MQTT.'),
+                 ({'via_mqtt': True}, 'Hops: unknown. MQTT.'),
+                 ({'hops': 0, 'transport': 'mqtt'}, 'Hops: 0. MQTT.'),
+                 ({'hops': 0, 'transport': 'gateway'}, 'Hops: 0. Gateway.'),
+                 ({'transport': 'gateway'}, 'Hops: unknown. Gateway.'),
+                 ({'transport': 'rf'}, 'Hops: unknown.'),
+                 ({}, 'Hops: unknown.'),
+                 ({'hops': False}, 'Hops: unknown.'),
+                 ({'hops': -1}, 'Hops: unknown.'),
+                 ({'hops': 8}, 'Hops: unknown.')]
+        for metadata, expected in cases:
+            with self.subTest(metadata=metadata):
+                text = (await self.request(snr=7.5, rssi=-85, noise_floor=-110, **metadata)).text
+                self.assertEqual(text, '🏓 Pong. ' + expected)
+
+    async def test_noise_floor_is_opt_in_and_validated_for_direct_rf(self):
+        self.registration = ping.register({'show_noise_floor': True})
+        self.assertEqual((await self.request(hops=0, noise_floor=-110)).text,
+                         '🏓 Pong. Direct RF. Noise floor: -110 dBm.')
+        for invalid in (None, float('nan'), float('inf'), False):
+            self.assertEqual((await self.request(hops=0, noise_floor=invalid)).text,
+                             '🏓 Pong. Direct RF.')
+
+    async def test_auto_ping_uses_the_original_requests_route_diagnostics(self):
+        await self.request(arguments='2', hops=2, via_mqtt=True, snr=7.5, rssi=-85)
+        await self.tick(20)
+        await self.tick(40)
+        self.assertEqual([response.text for response, _ in self.services.sent],
+                         ['Reply 1/2. 🏓 Pong. Hops: 2. MQTT.',
+                          'Reply 2/2. 🏓 Pong. Hops: 2. MQTT.'])
 
     async def test_repeat_count_timing_completion_and_origin(self):
         result = await self.request(arguments='3 #Road test', channel=2, interface='secondary')
@@ -192,12 +227,27 @@ class PingTests(unittest.IsolatedAsyncioTestCase):
     def test_settings_reject_invalid_values(self):
         for settings in [{'max_count': True}, {'max_count': 51}, {'max_sessions': 0},
                          {'buffer_bytes': 10}, {'interval_seconds': float('nan')},
-                         {'interval_seconds': 0}, {'reply_privately': 'true'}, {'reply': ''}]:
+                         {'interval_seconds': 0}, {'reply_privately': 'true'},
+                         {'show_noise_floor': 'true'}, {'reply': ''}]:
             with self.subTest(settings=settings), self.assertRaises(ValueError):
                 ping.register(settings)
 
 
 class RadioMetadataTests(unittest.TestCase):
+    def test_ping_diagnostics_follow_normalized_radio_route_metadata(self):
+        base = {'from': 123, 'to': 42, 'rxSnr': 7.5, 'rxRssi': -85,
+                'hopStart': 3, 'decoded': {'payload': b'ping'}}
+        cases = [({'hopLimit': 3}, 'Direct RF. SNR: 7.5 dB. RSSI: -85 dBm.'),
+                 ({'hopLimit': 1}, 'Hops: 2.'),
+                 ({'hopLimit': 1, 'viaMqtt': True}, 'Hops: 2. MQTT.'),
+                 ({'hopLimit': 3, 'transportMechanism': 'MQTT'}, 'Hops: 0. MQTT.'),
+                 ({'hopLimit': 3, 'transportMechanism': 'UDP'}, 'Hops: 0. Gateway.'),
+                 ({'transportMechanism': 'LORA'}, 'Hops: unknown.'),
+                 ({'hopLimit': 4}, 'Hops: unknown.')]
+        for metadata, expected in cases:
+            with self.subTest(metadata=metadata):
+                self.assertEqual(ping.diagnostics(radio_message(base | metadata, 42)), expected)
+
     def test_normalizes_link_metadata_and_missing_measurements(self):
         packet = {'from': 123, 'to': 42, 'channel': 2, 'rxSnr': 0, 'rxRssi': -70,
                   'hopStart': 3, 'hopLimit': 2, 'viaMqtt': True,

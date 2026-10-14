@@ -1,12 +1,13 @@
 [plugin]
 id = "ping"
-version = "1.1.0"
+version = "1.2.0"
 api_version = 1
 enabled = true
 
 [settings]
 reply = "🏓 Pong."
 reply_privately = true
+show_noise_floor = false
 interval_seconds = 20
 max_count = 50
 max_sessions = 2

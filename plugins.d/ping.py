@@ -33,21 +33,25 @@ def clipped(text, limit=80):
     return " ".join(words) + "…"
 
 
-def diagnostics(message):
-    details = []
-    if message.via_mqtt:
-        details.append("Route: MQTT.")
-    elif message.transport == "gateway":
-        details.append("Route: gateway.")
-    elif message.hops is not None:
-        details.append("Route: direct RF." if message.hops == 0 else
-                       f"Route: {message.hops} {'hop' if message.hops == 1 else 'hops'}.")
-    elif message.transport == "rf":
-        details.append("Route: RF.")
-    for value, label, units in ((message.snr, "SNR", "dB"), (message.rssi, "RSSI", "dBm"),
-                                (message.noise_floor, "Noise floor", "dBm")):
-        if type(value) in (int, float) and math.isfinite(value):
-            details.append(f"{label}: {value:g} {units}.")
+def diagnostics(message, show_noise_floor=False):
+    hops = message.hops if type(message.hops) is int and 0 <= message.hops <= 7 else None
+    mqtt = message.via_mqtt or message.transport == "mqtt"
+    if hops == 0 and not mqtt and message.transport != "gateway":
+        details = ["Direct RF."]
+        readings = [(message.snr, "SNR", "dB"), (message.rssi, "RSSI", "dBm")]
+        if show_noise_floor:
+            readings.append((message.noise_floor, "Noise floor", "dBm"))
+        for value, label, units in readings:
+            if type(value) in (int, float) and math.isfinite(value):
+                details.append(f"{label}: {value:g} {units}.")
+    else:
+        # RF readings on relayed traffic describe the last RF link, not the
+        # requester's connection. MQTT/gateway traffic is never direct RF.
+        details = [f"Hops: {hops}." if hops is not None else "Hops: unknown."]
+        if mqtt:
+            details.append("MQTT.")
+        elif message.transport == "gateway":
+            details.append("Gateway.")
     return " ".join(details)
 
 
@@ -77,7 +81,8 @@ def register(settings):
     interval = settings.get("interval_seconds", 20)
     if type(interval) not in (int, float) or not math.isfinite(interval) or not 1 <= interval <= 3600:
         raise ValueError("ping settings.interval_seconds must be from 1 to 3600")
-    for name, default in (("reply_privately", True), ("allow_channel_sequences", False)):
+    for name, default in (("reply_privately", True), ("allow_channel_sequences", False),
+                          ("show_noise_floor", False)):
         values[name] = settings.get(name, default)
         if type(values[name]) is not bool:
             raise ValueError(f"ping settings.{name} must be a boolean")
@@ -90,7 +95,7 @@ def register(settings):
         text = {"ping": reply, "pong": "Ping.", "ack": "Acknowledged.",
                 "test": "Testing, one, two, three.", "bell": "I can hear you.",
                 "cq": f"CQ acknowledged. This is {clipped(message.node_name or 'Mesh Bot', 32)}."}[kind]
-        info = diagnostics(message)
+        info = diagnostics(message, values["show_noise_floor"])
         tag = f"Tag: {label}" + ("" if label.endswith((".", "!", "?", "…")) else ".") if label else ""
         return " ".join(part for part in (text, info, tag) if part)
 
