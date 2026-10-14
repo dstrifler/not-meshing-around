@@ -79,6 +79,33 @@ class MentionResolutionTests(unittest.TestCase):
                          "@!00000001 @!00000001 @!00000002 @!00000002")
         self.assertEqual(resolver.normalize("@Jose\u0301"), "@Jose\u0301")
 
+    def test_name_limits_count_utf8_bytes_and_allow_shorter_short_names(self):
+        ascii_name, unicode_name = "A" * 39, "漢" * 13
+        resolver = MentionResolver((NodeIdentity(1, ascii_name, "Bo"),
+                                    NodeIdentity(2, unicode_name, "🌍"),
+                                    NodeIdentity(3, "Compact name" + "x" * 12, "ABCD")))
+        self.assertEqual(resolver.normalize(f"@{ascii_name} @{unicode_name} @Bo @🌍 @ABCD"),
+                         "@!00000001 @!00000002 @!00000001 @!00000002 @!00000003")
+        # A 24-byte compact database name remains an exact match too.
+        self.assertEqual(resolver.normalize("@Compact name" + "x" * 12), "@!00000003")
+        for source in ("@" + ascii_name + "A", "@" + unicode_name + "漢", "@ABCDx"):
+            self.assertEqual(resolver.normalize(source), source)
+
+    def test_oversized_database_names_are_ignored_without_truncating_or_losing_ids(self):
+        resolver = MentionResolver((NodeIdentity(1, "A" * 40, "ABCDE"),
+                                    NodeIdentity(2, "漢" * 14, "🌍x"),
+                                    NodeIdentity(3, "Valid", "İİ")))
+        for source in ("@" + "A" * 40, "@ABCDE", "@" + "漢" * 14, "@🌍x", "@i\u0307i\u0307"):
+            self.assertEqual(resolver.normalize(source), source)
+        self.assertEqual(resolver.normalize("@1 @2 @Valid @İİ"),
+                         "@!00000001 @!00000002 @!00000003 @!00000003")
+
+    def test_numeric_limits_reject_longer_fields_without_matching_a_prefix(self):
+        resolver = MentionResolver((BOB, ALICE))
+        for source in ("@000000000042", "@4294967296", "@0x0deadbeef", "@!0deadbeef",
+                       "@deadbeef00", "@0xdeadbeefZ", "@" + "4" * 10000):
+            self.assertEqual(resolver.normalize(source), source)
+
 
 class MentionFormattingTests(unittest.TestCase):
     def assert_packets(self, text, limit, mentions):

@@ -5,9 +5,13 @@ import unicodedata
 from dataclasses import dataclass
 
 
-HEX_RUN = re.compile(r"![0-9a-fA-F]+")
-HEX_NUMBER = re.compile(r"0[xX]([0-9a-fA-F]+)")
-WORD = re.compile(r"[0-9A-Za-z]+")
+MAX_LONG_NAME_BYTES = 39  # User.long_name's 40-byte buffer includes a terminator.
+MAX_SHORT_NAME_BYTES = 4  # User.short_name's 5-byte buffer includes a terminator.
+MAX_NODE_NUMBER = 0xffffffff
+
+HEX_RUN = re.compile(r"![0-9a-fA-F]{8}(?![0-9a-fA-F])")
+HEX_NUMBER = re.compile(r"0[xX]([0-9a-fA-F]{1,8})")
+WORD = re.compile(r"[0-9A-Za-z]{1,10}")
 # Keep even malformed longer hex runs together: splitting one after eight
 # digits could accidentally turn its first packet into a valid mention.
 ATOMIC_MENTION = re.compile(r"@![0-9a-fA-F]+")
@@ -21,7 +25,7 @@ class NodeIdentity:
 
 
 def valid_number(number):
-    return type(number) is int and 0 <= number <= 0xffffffff
+    return type(number) is int and 0 <= number <= MAX_NODE_NUMBER
 
 
 def word_character(char):
@@ -39,36 +43,43 @@ def boundary(text, end):
 
 class MentionResolver:
     def __init__(self, nodes=()):
-        self.names = {}
+        self.long_names, self.short_names = {}, {}
         self.numbers = set()
         for node in nodes:
             if not isinstance(node, NodeIdentity) or not valid_number(node.number):
                 continue
             self.numbers.add(node.number)
-            for name in (node.long_name, node.short_name):
-                if isinstance(name, str) and name.strip() and not any(char in name for char in "\r\n\t"):
-                    self.names.setdefault(name.strip().casefold(), set()).add(node.number)
-        self.max_name = max(map(len, self.names), default=0)
+            for name, limit, index in ((node.long_name, MAX_LONG_NAME_BYTES, self.long_names),
+                                       (node.short_name, MAX_SHORT_NAME_BYTES, self.short_names)):
+                if (isinstance(name, str) and name.strip() and
+                        not any(char in name for char in "\r\n\t") and len(name.encode("utf-8")) <= limit):
+                    index.setdefault(name.strip().casefold(), set()).add(node.number)
 
     def reference(self, text):
         """Return consumed characters and one unambiguous numeric identity."""
         if text.startswith("!"):
             match = HEX_RUN.match(text)
-            if match and len(match[0]) == 9:
+            if match:
                 number = int(match[0][1:], 16)
                 return len(match[0]), number if number in self.numbers else None
             return 0, None
-        if text.lower().startswith("0x"):
+        if text[:2].lower() == "0x":
             match = HEX_NUMBER.match(text)
-            if match and len(match[1]) <= 8 and boundary(text, match.end()):
+            if match and boundary(text, match.end()):
                 number = int(match[1], 16)
                 return match.end(), number if number in self.numbers else None
             return 0, None
 
-        length, targets = 0, set()
-        for end in range(1, min(len(text), self.max_name) + 1):
+        length, targets, size = 0, set(), 0
+        for end, char in enumerate(text[:MAX_LONG_NAME_BYTES], 1):
+            size += len(char.encode("utf-8"))
+            if size > MAX_LONG_NAME_BYTES:
+                break
             if boundary(text, end):
-                named = self.names.get(text[:end].casefold())
+                key = text[:end].casefold()
+                named = self.long_names.get(key, set())
+                if size <= MAX_SHORT_NAME_BYTES:
+                    named = named | self.short_names.get(key, set())
                 if named:
                     length, targets = end, set(named)
 

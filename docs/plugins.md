@@ -165,6 +165,25 @@ Core converts recognized bare `@tags` to Meshtastic's wire token, `@!deadbeef`:
 an `@`, `!`, and eight lowercase hexadecimal digits identifying a 32-bit node.
 There are no brackets. This is a node ID, not a full MAC address.
 
+Searches after `@` have three protocol bounds, excluding the `@` itself:
+
+| Reference | Limit |
+| --- | --- |
+| Long name | Up to 39 UTF-8 bytes, including spaces. |
+| Short name | Up to 4 UTF-8 bytes; shorter names are valid. |
+| Node number | Unsigned 32-bit, `0`–`4294967295`: at most 10 decimal digits, exactly 8 bare hex digits, or 1–8 hex digits after `0x`. Wire IDs use `!` and exactly 8 hex digits. |
+
+Bytes are not characters: a four-byte emoji can fill the entire short-name field.
+Names exceeding their field limit are ignored, rather than truncated into another
+node's name. Case-insensitive matching still respects the input's byte limit.
+Current 2.8 firmware stores long names in a 24-byte compact node database; core
+matches that stored spelling and retains the 39-byte bound for older nodes/SDK
+data. It does not attempt to reconstruct truncated names.
+These bounds come from the protocol's
+[name buffer definitions](https://github.com/meshtastic/protobufs/blob/28f4f5f5c31c0323bfb86d890a1acaff15d1c4c6/meshtastic/mesh.options),
+[compact storage definitions](https://github.com/meshtastic/protobufs/blob/28f4f5f5c31c0323bfb86d890a1acaff15d1c4c6/meshtastic/deviceonly.options),
+and [32-bit node number field](https://github.com/meshtastic/protobufs/blob/28f4f5f5c31c0323bfb86d890a1acaff15d1c4c6/meshtastic/mesh.proto).
+
 For a known node numbered `3735928559` (`0xdeadbeef`) with long name
 `Alice Smith` and short name `ALIC`, these references all become `@!deadbeef`:
 
