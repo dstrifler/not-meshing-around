@@ -25,6 +25,26 @@ class CleanupError(RuntimeError):
         super().__init__(f"cleanup failed: {details}")
 
 
+async def _invoke_plugin(awaitable, timeout, cancelled_message):
+    """Isolate plugin cancellation while preserving new caller cancellations."""
+    caller = asyncio.current_task()
+    cancelling = caller.cancelling()
+    task = asyncio.create_task(awaitable)
+    try:
+        result = await asyncio.wait_for(task, timeout)
+    except asyncio.CancelledError as error:
+        if caller.cancelling() > cancelling:
+            raise
+        raise RuntimeError(cancelled_message) from error
+    except Exception as error:
+        if caller.cancelling() > cancelling:
+            raise asyncio.CancelledError() from error
+        raise
+    if caller.cancelling() > cancelling:
+        raise asyncio.CancelledError()
+    return result
+
+
 def _payload_chunks(text: str, limit: int) -> list[str]:
     """Prefer word boundaries while preserving the original payload."""
     result, current, size = [], [], 0
@@ -236,20 +256,25 @@ class Runtime:
         services = PluginServices(self, name)
         try:
             if registration.start:
-                await asyncio.wait_for(registration.start(services), 10)
+                await _invoke_plugin(registration.start(services), 10, "plugin startup cancelled")
             state.status = "active"
             for command in registration.commands:
                 for alias in (command.text, *command.aliases):
                     self.commands[alias] = (name, command)
             if self._running:
                 self._start_jobs(name, state)
-        except BaseException:
+        except BaseException as original:
             state.status = "failed"
+            if isinstance(original, asyncio.CancelledError) and isinstance(original.__cause__, Exception):
+                self.failed(name, original.__cause__)
             if registration.stop:
                 try:
-                    await asyncio.wait_for(registration.stop(services), 10)
-                except asyncio.CancelledError:
-                    error = RuntimeError("startup cleanup cancelled")
+                    # Rollback can begin with a previously delivered management
+                    # cancellation. Only a new cancellation should interrupt it.
+                    await _invoke_plugin(registration.stop(services), 10, "startup cleanup cancelled")
+                except asyncio.CancelledError as cancelled:
+                    error = (cancelled.__cause__ if isinstance(cancelled.__cause__, Exception)
+                             else RuntimeError("startup cleanup cancelled"))
                     state.cleanup_error = error
                     self.failed(name, error)
                     raise
@@ -294,24 +319,12 @@ class Runtime:
 
     async def _invoke_handler(self, name, handler, *args):
         """Contain plugin cancellation while preserving cancellation of core work."""
-        caller = asyncio.current_task()
-        task = asyncio.create_task(handler(*args))
         try:
-            result = await asyncio.wait_for(task, 30)
+            return await _invoke_plugin(handler(*args), 30, "plugin handler cancelled")
         except asyncio.CancelledError as error:
-            if caller.cancelling():
-                raise
-            raise RuntimeError("plugin handler cancelled") from error
-        except Exception as error:
-            # Cleanup may replace management's cancellation with another error.
-            if caller.cancelling():
-                self.failed(name, error)
-                raise asyncio.CancelledError() from error
+            if isinstance(error.__cause__, Exception):
+                self.failed(name, error.__cause__)
             raise
-        # A handler may suppress cancellation and return normally during cleanup.
-        if caller.cancelling():
-            raise asyncio.CancelledError()
-        return result
 
     async def dispatch(self, message):
         if self._closing:
