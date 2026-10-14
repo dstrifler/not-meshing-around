@@ -21,6 +21,20 @@ Run `bash launch.sh` for an interactive session. EOF, Ctrl+C, or SIGTERM shuts
 down the controller. Edit `bot.toml` to use a Meshtastic TCP or serial node.
 Use `--config /path/to/local.toml` for a separate configuration file.
 
+## Install as a Linux service
+
+On Debian/Ubuntu or Raspberry Pi OS with systemd:
+
+```sh
+sudo bash install.sh
+```
+
+The installer asks for the installation directory (default `/opt/meshbot`), system
+group/user (both default `meshbot`), and TCP or serial radio settings. It installs
+dependencies, creates the venv and dedicated account, and enables and starts
+`meshbot.service`. The checkout can live anywhere. See the
+[installation guide](docs/install.md) for supported releases, previews, and updates.
+
 ## Architecture
 
 ```text
