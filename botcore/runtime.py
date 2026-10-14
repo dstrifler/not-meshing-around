@@ -66,6 +66,17 @@ def _payload_chunks(text: str, limit: int) -> list[str]:
     return result
 
 
+def packet_prefix(index, total):
+    return f"[{index}/{total}] " if total > 1 else ""
+
+
+def packet_payload_bytes(limit, packet_count):
+    """Reserve the widest numbering prefix for a planned response."""
+    if type(packet_count) is not int or packet_count < 1:
+        raise ValueError("packet count must be a positive integer")
+    return limit - len(packet_prefix(packet_count, packet_count).encode("utf-8"))
+
+
 def chunks(text: str, limit: int) -> list[str]:
     """Number multipart messages; include prefix bytes in every packet's budget."""
     if type(limit) is not int or limit < 4:
@@ -77,13 +88,13 @@ def chunks(text: str, limit: int) -> list[str]:
     total = 2
     while True:
         # Reserve the widest prefix, then recalculate if the count grows.
-        budget = limit - len(f"[{total}/{total}] ")
+        budget = packet_payload_bytes(limit, total)
         if budget < 1:
             raise ValueError("message byte limit is too small for split tags and payload")
         parts = _payload_chunks(text, budget)
         if len(parts) <= total:
             total = len(parts)
-            return [f"[{index}/{total}] {part}" for index, part in enumerate(parts, 1)]
+            return [packet_prefix(index, total) + part for index, part in enumerate(parts, 1)]
         total = len(parts)
 
 
@@ -146,6 +157,13 @@ class PluginServices:
     def message_bytes(self):
         return self._runtime.byte_limit
 
+    def command_names(self, message):
+        """Snapshot active primary names allowed for this request, without aliases."""
+        return self._runtime.command_names(message)
+
+    def packet_payload_bytes(self, packet_count):
+        return packet_payload_bytes(self.message_bytes, packet_count)
+
     async def reply(self, response, message):
         """Delayed replies retain their original audience and delivery policy."""
         if self._runtime.plugins[self._plugin].status != "active":
@@ -199,6 +217,13 @@ class Runtime:
         return {name: {"status": state.status, "errors": state.errors,
                        "last_error": state.last_error}
                 for name, state in self.plugins.items()}
+
+    def command_names(self, message):
+        if self._closing:
+            return ()
+        return tuple(sorted({command.text for alias, (name, command) in self.commands.items()
+                             if alias == command.text and self.plugins[name].status == "active"
+                             and self.policy.allows(message, command)}))
 
     def _mention_resolver(self, interface):
         snapshot = getattr(self.transport, "node_snapshot", None)
@@ -368,8 +393,13 @@ class Runtime:
     async def deliver(self, plugin, response, message=None):
         if self._closing:
             raise RuntimeError("runtime is stopping")
-        if not isinstance(response, Response) or not isinstance(response.text, str):
+        if not isinstance(response, Response) or not isinstance(response.text, (str, tuple)):
             raise TypeError("handlers must return Response objects")
+        if type(response.normalize_mentions) is not bool:
+            raise TypeError("normalize_mentions must be a boolean")
+        if isinstance(response.text, tuple) and (not response.text or
+                any(not isinstance(part, str) or not part for part in response.text)):
+            raise ValueError("preplanned responses require nonempty text packet bodies")
         if response.destination not in ("reply", "private", "channel"):
             raise ValueError("invalid response destination")
         if message is None and response.destination != "channel":
@@ -392,8 +422,18 @@ class Runtime:
         try:
             if self._closing:
                 raise RuntimeError("runtime is stopping")
-            text = self.normalize_mentions(response.text, interface)
-            for part in chunks(text, self.byte_limit):
+            bodies = response.text if isinstance(response.text, tuple) else (response.text,)
+            if response.normalize_mentions and any("@" in body for body in bodies):
+                resolver = self._mention_resolver(interface)
+                bodies = tuple(resolver.normalize(body) for body in bodies)
+            if isinstance(response.text, tuple):
+                total = len(bodies)
+                parts = [packet_prefix(index, total) + body for index, body in enumerate(bodies, 1)]
+                if any(len(part.encode("utf-8")) > self.byte_limit for part in parts):
+                    raise ValueError("preplanned packet exceeds core.message_bytes after formatting")
+            else:
+                parts = chunks(bodies[0], self.byte_limit)
+            for part in parts:
                 try:
                     async with asyncio.timeout(self.send_timeout):
                         await self.transport.send(part, destination, channel, interface)

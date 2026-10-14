@@ -23,10 +23,11 @@ class Message:
 
 @dataclass(frozen=True)
 class Response:
-    text: str
+    text: str | tuple[str, ...]  # A tuple supplies preplanned packet bodies.
     destination: str = "reply"  # reply, private, or channel
     channel: int | None = None
     interface: str | None = None
+    normalize_mentions: bool = True
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,8 @@ class EventQueueFull(RuntimeError):
 class Services(Protocol):
     @property
     def message_bytes(self) -> int: ...
+    def command_names(self, message: Message) -> tuple[str, ...]: ...
+    def packet_payload_bytes(self, packet_count: int) -> int: ...
     def get(self, key: str, default: Any = None) -> Any: ...
     def set(self, key: str, value: Any) -> None: ...
     async def emit(self, event: Event) -> None: ...

@@ -2,7 +2,7 @@
 
 A plugin-driven Meshtastic bot, rebuilding the architecture of meshing-around.
 One controller starts the core services and adopts enabled plugins from
-`plugins.d/`. A ping-only bot enables only the ping plugin.
+`plugins.d/`. The default installation enables command discovery and ping.
 
 ## Quick start
 
@@ -15,6 +15,8 @@ printf 'ping\n' | venv/bin/python mesh_bot.py
 ```
 
 The default transport is a local console: type `ping` to receive `🏓 Pong. Hops: unknown.`.
+Type `cmd` to list available primary command names. Every reply packet includes
+the `CMD | Help` header; core numbers multipart lists within the byte limit.
 Run `bash launch.sh` for an interactive session. EOF, Ctrl+C, or SIGTERM shuts
 down the controller. Edit `bot.toml` to use a Meshtastic TCP or serial node.
 Use `--config /path/to/local.toml` for a separate configuration file.
@@ -43,7 +45,7 @@ changes to core code. See the [plugin development guide](docs/plugins.md).
 venv/bin/python -m unittest discover -s tests -v
 ```
 
-Only ping has been ported. Physical radio operation has not yet been validated.
+Command discovery and ping are available. Physical radio operation has not yet been validated.
 The original modules, assets, documentation, and deployment scripts are preserved
 in [integration/](integration/README.md) as migration reference; they are not part
 of the supported runtime. Use the original meshing-around project if you need
