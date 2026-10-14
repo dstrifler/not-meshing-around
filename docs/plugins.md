@@ -207,8 +207,15 @@ that worker. No replacement radio sends are allowed after a send failure.
 
 Exceptions in command, event, or job handlers are logged and counted in
 `Runtime.health()` with the last error. They do not stop other plugins. Command,
-event, and job handlers have a 30-second timeout. Plugins run as trusted Python
-code inside one process: this API is a software boundary, not a security sandbox.
+event, and job handlers have a 30-second timeout and run in individual tasks.
+A handler that cancels itself, raises `CancelledError`, or awaits a cancelled
+child task records a `plugin handler cancelled` error. Command dispatch continues,
+remaining event subscribers still receive the event, and jobs run on later intervals.
+Management can still cancel the core task and its handler during shutdown, even
+if the handler suppresses cancellation or raises another exception while cleaning up.
+Cleanup exceptions are still logged and counted before management's cancellation
+propagates. Plugins run as trusted Python code inside one process: this API is a
+software boundary, not a security sandbox.
 Infinite synchronous code, process termination, or malicious code cannot be
 contained by these exception handlers. Plugin-owned tasks must be cancelled in
 their shutdown hook; prefer registered jobs for core-managed background work.
