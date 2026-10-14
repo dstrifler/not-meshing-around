@@ -116,7 +116,13 @@ Handlers and lifecycle hooks are asynchronous; blocking I/O belongs in
   `--check` never run jobs. The interval begins when jobs are enabled.
 - `start(services)` and `stop(services)` own resource setup and cleanup. Startup
   has a 10-second timeout and cleanup runs even when startup fails. Commands
-  and jobs are activated only after successful startup. Job tasks are cancelled
+  and jobs are activated only after successful startup. Startup and rollback
+  hooks run in individual tasks: hook-local cancellation rejects that plugin
+  while loading continues. Rollback cancellation remains a recorded cleanup
+  failure, reported to management after later cleanup. Management cancellation
+  still aborts loading and allows rollback to run; another management cancellation
+  can interrupt rollback. Both hooks retain their 10-second timeouts.
+  Job tasks are cancelled
   before shutdown hooks. Hooks must make cleanup safe after partial startup.
   Stop hooks run concurrently after all job cancellation completes, so they must
   own their resources independently and must not depend on another plugin's
