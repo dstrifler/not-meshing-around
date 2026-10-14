@@ -292,6 +292,27 @@ class Runtime:
         state.last_error = str(error)
         log.exception("Plugin %s handler failed", name)
 
+    async def _invoke_handler(self, name, handler, *args):
+        """Contain plugin cancellation while preserving cancellation of core work."""
+        caller = asyncio.current_task()
+        task = asyncio.create_task(handler(*args))
+        try:
+            result = await asyncio.wait_for(task, 30)
+        except asyncio.CancelledError as error:
+            if caller.cancelling():
+                raise
+            raise RuntimeError("plugin handler cancelled") from error
+        except Exception as error:
+            # Cleanup may replace management's cancellation with another error.
+            if caller.cancelling():
+                self.failed(name, error)
+                raise asyncio.CancelledError() from error
+            raise
+        # A handler may suppress cancellation and return normally during cleanup.
+        if caller.cancelling():
+            raise asyncio.CancelledError()
+        return result
+
     async def dispatch(self, message):
         if self._closing:
             return False
@@ -304,9 +325,9 @@ class Runtime:
             if not self.policy.allows(message, command):
                 return False
             try:
-                reply = await asyncio.wait_for(command.handler(Context(
+                reply = await self._invoke_handler(name, command.handler, Context(
                     message, command.text, text[len(alias):].strip(),
-                    PluginServices(self, name))), 30)
+                    PluginServices(self, name)))
                 for response in reply if isinstance(reply, list) else ([] if reply is None else [reply]):
                     await self.deliver(name, response, message)
             except Exception as error:
@@ -360,7 +381,7 @@ class Runtime:
                 for subscription in state.registration.events:
                     if subscription.event == event.name:
                         try:
-                            await asyncio.wait_for(subscription.handler(event, PluginServices(self, name)), 30)
+                            await self._invoke_handler(name, subscription.handler, event, PluginServices(self, name))
                         except Exception as error:
                             self.failed(name, error)
 
@@ -368,7 +389,7 @@ class Runtime:
         while True:
             await asyncio.sleep(job.interval)
             try:
-                await asyncio.wait_for(job.handler(services), 30)
+                await self._invoke_handler(name, job.handler, services)
             except Exception as error:
                 self.failed(name, error)
 
