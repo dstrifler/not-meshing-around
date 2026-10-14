@@ -189,8 +189,9 @@ Later cleanup stages still run if an earlier one times out. Radio connection and
 cleanup also have their own `radio.connect_timeout` (20 seconds) and
 `radio.close_timeout` (5 seconds) deadlines.
 Runtime job cancellation and concurrent stop hooks have separate cleanup budgets.
-A failed or timed-out stop hook leaves its plugin marked `failed`, records the
-error, and allows other hooks to finish with storage still available. Storage is closed and
+A failed, timed-out, or cancelled stop hook leaves its plugin marked `failed`,
+records the error, and allows other hooks to finish with storage still available.
+This includes a hook awaiting a background task it has cancelled. Storage is closed and
 transport cleanup is attempted before aggregated cleanup errors reach management. Failed
 cleanup makes normal shutdown and `--check` exit nonzero; failures in multiple
 cleanup stages are included in the error report.

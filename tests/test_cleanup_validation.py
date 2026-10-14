@@ -85,6 +85,81 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
             await self.runtime.close()
         self.assertEqual(self.runtime.health()["broken"]["errors"], 1)
 
+    async def test_cancelled_child_in_stop_hook_does_not_interrupt_other_cleanup(self):
+        other_started, release_other = asyncio.Event(), asyncio.Event()
+        background = asyncio.create_task(asyncio.Event().wait())
+        other_tasks, cleaned = [], []
+
+        async def cancelled_stop(services):
+            await other_started.wait()
+            background.cancel()
+            await background
+
+        async def other_stop(services):
+            other_tasks.append(asyncio.current_task())
+            other_started.set()
+            await release_other.wait()
+            services.set("cleaned", True)
+            cleaned.append(services.get("cleaned"))
+
+        await self.runtime.activate("cancelled", Registration(stop=cancelled_stop))
+        await self.runtime.activate("other", Registration(stop=other_stop))
+        with self.assertLogs("botcore.runtime", level="ERROR"):
+            closing = asyncio.create_task(self.runtime.close())
+            try:
+                async def cancellation_reported():
+                    while self.runtime.health()["cancelled"]["status"] != "failed":
+                        await asyncio.sleep(0)
+
+                await asyncio.wait_for(cancellation_reported(), 10)
+                release_other.set()
+                with self.assertRaises(CleanupError) as caught:
+                    await asyncio.wait_for(closing, 10)
+                self.assertEqual(set(caught.exception.failures), {"cancelled"})
+                self.assertEqual(str(caught.exception.failures["cancelled"]), "shutdown hook cancelled")
+                self.assertEqual(cleaned, [True])
+                self.assertEqual(self.runtime.health()["other"]["status"], "stopped")
+                self.assertEqual(self.runtime.health()["other"]["errors"], 0)
+                self.assertEqual(self.runtime.health()["cancelled"]["errors"], 1)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    self.runtime.db.execute("SELECT 1")
+            finally:
+                release_other.set()
+                background.cancel()
+                await asyncio.gather(closing, background, *other_tasks, return_exceptions=True)
+
+    async def test_cancelling_close_still_propagates_after_hooks_release_resources(self):
+        entered = [asyncio.Event(), asyncio.Event()]
+        cleaned = []
+
+        def hook(index):
+            async def stop(services):
+                entered[index].set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    await asyncio.sleep(0)
+                    services.set("cleaned", True)
+                    cleaned.append(index)
+            return stop
+
+        for index in range(2):
+            await self.runtime.activate(f"plugin{index}", Registration(stop=hook(index)))
+        with self.assertLogs("botcore.runtime", level="ERROR"):
+            closing = asyncio.create_task(self.runtime.close())
+            try:
+                await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), 10)
+                closing.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await closing
+            finally:
+                closing.cancel()
+                await asyncio.gather(closing, return_exceptions=True)
+        self.assertCountEqual(cleaned, [0, 1])
+        self.assertTrue(all(state["status"] == "failed" for state in self.runtime.health().values()))
+        with self.assertRaises(sqlite3.ProgrammingError):
+            self.runtime.db.execute("SELECT 1")
+
 
 class RadioConfigurationTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_radio_is_rejected_before_plugin_loading_or_storage(self):
@@ -167,9 +242,10 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CheckExitStatusTests(unittest.TestCase):
-    def test_hook_failure_and_timeout_return_nonzero_after_other_cleanup(self):
+    def test_hook_failure_timeout_and_cancellation_return_nonzero_after_other_cleanup(self):
         for body, error in (("raise OSError('release failed')", "release failed"),
-                            ("await asyncio.Event().wait()", "shutdown hook timed out")):
+                            ("await asyncio.Event().wait()", "shutdown hook timed out"),
+                            ("raise asyncio.CancelledError('cancelled child task')", "shutdown hook cancelled")):
             with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 plugins = root / "plugins"
@@ -180,6 +256,11 @@ class CheckExitStatusTests(unittest.TestCase):
                 (plugins / "broken.py").write_text('import asyncio\nfrom botcore.api import Registration\n'
                     f'async def stop(services):\n    {body}\n'
                     'def register(settings): return Registration(stop=stop)\n')
+                (plugins / "healthy.toml").write_text(
+                    '[plugin]\nid="healthy"\nversion="1"\napi_version=1\nenabled=true\n')
+                (plugins / "healthy.py").write_text('import asyncio\nfrom botcore.api import Registration\n'
+                    'async def stop(services):\n    await asyncio.sleep(0.01)\n    services.set("cleaned", True)\n'
+                    'def register(settings): return Registration(stop=stop)\n')
                 result = subprocess.run([sys.executable, "mesh_bot.py", "--config", str(root / "bot.toml"), "--check"],
                     cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 1, result.stderr)
@@ -187,6 +268,11 @@ class CheckExitStatusTests(unittest.TestCase):
                 health = json.loads(result.stdout.splitlines()[-1])
                 self.assertEqual(health["transport"]["status"], "stopped")
                 self.assertEqual(health["plugins"]["broken"]["status"], "failed")
+                self.assertEqual(health["plugins"]["healthy"]["status"], "stopped")
+                with sqlite3.connect(root / "data/core.db") as database:
+                    self.assertEqual(database.execute(
+                        'SELECT value FROM state WHERE plugin=? AND key=?', ("healthy", "cleaned")).fetchone(),
+                        ("true",))
 
 
 if __name__ == "__main__":
