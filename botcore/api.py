@@ -18,6 +18,7 @@ class Message:
     node_name: str | None = None
     noise_floor: float | None = None
     transport: str | None = None
+    original_text: str | None = None  # Received text before core mention normalization.
 
 
 @dataclass(frozen=True)

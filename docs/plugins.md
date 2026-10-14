@@ -37,7 +37,8 @@ or open hardware, and do not test whether the configured node is reachable.
 
 - Controller: configuration, plugin adoption, startup report, signals, shutdown.
 - Core: transport adapters, command dispatcher, policy, event queue, interval
-  scheduler, UTF-8 byte chunking, serialized delivery, namespaced SQLite state.
+  scheduler, node mention normalization, UTF-8 byte chunking, serialized delivery,
+  namespaced SQLite state.
 - Plugins: feature logic, command registrations, event subscriptions, jobs,
   configuration validation, and lifecycle hooks.
 
@@ -98,8 +99,10 @@ invalid registrations never receive partial command registrations.
 Handlers and lifecycle hooks are asynchronous; blocking I/O belongs in
 `asyncio.to_thread`, or an asynchronous client.
 
-- Commands receive `Context`: normalized command name, arguments, original
+- Commands receive `Context`: normalized command name, arguments, received
   `Message` (sender, channel, interface, DM status), and plugin services.
+  Node mentions in arguments and `Message.text` are normalized as described below;
+  `Message.original_text` retains the received text before normalization.
   Messages also provide optional normalized SNR, RSSI, noise floor, hop count,
   MQTT status, and local node name for diagnostics.
   Return a `Response`, a list of responses, or `None`.
@@ -156,6 +159,67 @@ quoted IDs, booleans, and out-of-range values reject startup. The broadcast
 permission list must be an array of valid plugin ID strings. Policy validation
 runs before plugin initialization or database creation, including with `--check`.
 
+## Node mentions
+
+Core converts recognized bare `@tags` to Meshtastic's wire token, `@!deadbeef`:
+an `@`, `!`, and eight lowercase hexadecimal digits identifying a 32-bit node.
+There are no brackets. This is a node ID, not a full MAC address.
+
+Searches after `@` have three protocol bounds, excluding the `@` itself:
+
+| Reference | Limit |
+| --- | --- |
+| Long name | Up to 39 UTF-8 bytes, including spaces. |
+| Short name | Up to 4 UTF-8 bytes; shorter names are valid. |
+| Node number | Unsigned 32-bit, `0`–`4294967295`: at most 10 decimal digits, exactly 8 bare hex digits, or 1–8 hex digits after `0x`. Wire IDs use `!` and exactly 8 hex digits. |
+
+Bytes are not characters: a four-byte emoji can fill the entire short-name field.
+Names exceeding their field limit are ignored, rather than truncated into another
+node's name. Case-insensitive matching still respects the input's byte limit.
+Current 2.8 firmware stores long names in a 24-byte compact node database; core
+matches that stored spelling and retains the 39-byte bound for older nodes/SDK
+data. It does not attempt to reconstruct truncated names.
+These bounds come from the protocol's
+[name buffer definitions](https://github.com/meshtastic/protobufs/blob/28f4f5f5c31c0323bfb86d890a1acaff15d1c4c6/meshtastic/mesh.options),
+[compact storage definitions](https://github.com/meshtastic/protobufs/blob/28f4f5f5c31c0323bfb86d890a1acaff15d1c4c6/meshtastic/deviceonly.options),
+and [32-bit node number field](https://github.com/meshtastic/protobufs/blob/28f4f5f5c31c0323bfb86d890a1acaff15d1c4c6/meshtastic/mesh.proto).
+
+For a known node numbered `3735928559` (`0xdeadbeef`) with long name
+`Alice Smith` and short name `ALIC`, these references all become `@!deadbeef`:
+
+| Input | Interpretation |
+| --- | --- |
+| `@Alice Smith`, `@alic` | Case-insensitive long or short name. |
+| `@3735928559` | Decimal node number; digit-only input is always decimal. |
+| `@deadbeef`, `@0xDEADBEEF` | Eight-digit bare hex, or explicit `0x` hex. |
+| `@!DEADBEEF` | Existing wire token, normalized to lowercase. |
+
+Every conversion requires an unambiguous match in the connected radio SDK's
+current node database, including numeric references. Unknown and ambiguous tags
+remain exactly as received. For example, a hidden node's `@HIDE`, `@123`, or
+`@!ABCDEF12` stays unchanged if its identity is absent from that database.
+Duplicate names, and a name conflicting with another known node's number, are
+not guessed. The longest matching known name takes precedence; an ambiguous
+longest name is left unchanged. No name discovery or lookup over the mesh occurs.
+Console transport has no node database, so its tags stay unchanged.
+
+Normalization applies to command-handler input and every outgoing response,
+including delayed replies and messages from jobs/events. Each pass uses a fresh
+identity snapshot so renames are reflected on the next message. Command routing
+uses the original command spelling. `Message.original_text` preserves the input;
+sender, channel, interface, and reply audience retain their normal meanings.
+Mentioning a node does not change the message's recipient or delivery policy.
+Email addresses, URL paths, malformed IDs, and unrecognized references pass
+through unchanged.
+
+The wire format is verified against the official
+[Android mention model](https://github.com/meshtastic/Meshtastic-Android/blob/54a1a351683332028b3ce3987f6788276c3cf469/core/model/src/commonMain/kotlin/org/meshtastic/core/model/Mention.kt)
+and [Apple mention parser](https://github.com/meshtastic/Meshtastic-Apple/blob/c777bed951c5cca07e6770708adcaae62890e3b6/Meshtastic/Helpers/MentionParser.swift).
+The apps render these tokens as names; lowercase output also satisfies Apple's
+case-sensitive parser. Physical radio/app notification behavior has not been tested.
+
+## Delivery and lifecycle
+
 Delivery prefers word boundaries without dropping or reordering characters, respecting
 `core.message_bytes` as a UTF-8 byte limit. Oversized single words are split
 only when necessary to fit the byte limit. A delivery lock prevents chunks
@@ -166,7 +230,11 @@ including when counts gain digits. Responses that fit in one packet are unchange
 and have no prefix. Prefixes do not replace or truncate any original content.
 If the byte limit cannot accommodate a prefix and payload character, delivery
 fails explicitly rather than sending an oversized packet. Plugins return plain
-responses; the core owns numbering and split locations. Plugin-provided split
+responses; the core owns numbering and split locations. Node-ID mentions remain
+whole within a packet. If a mention cannot fit alongside the numbering prefix,
+the complete response fails before sending any packets. Longer malformed hex
+tokens also remain whole, preventing a split from creating an accidental valid
+mention. Plugin-provided split
 hints are reserved for future work.
 Transport failures are reported, without automatic retries or durable outbox
 semantics in this version.

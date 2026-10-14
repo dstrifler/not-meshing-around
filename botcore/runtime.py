@@ -7,9 +7,10 @@ import logging
 import math
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .api import Command, Context, Event, EventQueueFull, Job, Message, Registration, Response, Subscription
+from .mentions import MentionResolver, payload_units
 from .workers import positive_seconds
 
 log = logging.getLogger(__name__)
@@ -48,8 +49,8 @@ async def _invoke_plugin(awaitable, timeout, cancelled_message):
 def _payload_chunks(text: str, limit: int) -> list[str]:
     """Prefer word boundaries while preserving the original payload."""
     result, current, size = [], [], 0
-    for char in text:
-        width = len(char.encode("utf-8"))
+    for unit in payload_units(text):
+        width = len(unit.encode("utf-8"))
         if width > limit:
             raise ValueError("message byte limit is too small for split tags and payload")
         while size + width > limit:
@@ -58,7 +59,7 @@ def _payload_chunks(text: str, limit: int) -> list[str]:
             result.append("".join(current[:boundary]))
             current = current[boundary:]
             size = sum(len(item.encode("utf-8")) for item in current)
-        current.append(char)
+        current.append(unit)
         size += width
     if current:
         result.append("".join(current))
@@ -199,6 +200,14 @@ class Runtime:
                        "last_error": state.last_error}
                 for name, state in self.plugins.items()}
 
+    def _mention_resolver(self, interface):
+        snapshot = getattr(self.transport, "node_snapshot", None)
+        nodes = snapshot(interface) if snapshot else ()
+        return MentionResolver(nodes)
+
+    def normalize_mentions(self, text, interface="primary"):
+        return self._mention_resolver(interface).normalize(text) if "@" in text else text
+
     def enqueue_event(self, event):
         """Never wait on the queue whose consumer may be the calling handler."""
         if self._closing:
@@ -338,8 +347,16 @@ class Runtime:
             if not self.policy.allows(message, command):
                 return False
             try:
+                # Route by the original command spelling. Normalize message and
+                # arguments from one identity snapshot so aliases containing @
+                # remain valid and a radio update cannot change identities mid-call.
+                resolver = self._mention_resolver(message.interface) if "@" in message.text else None
+                normalized = replace(message,
+                    text=resolver.normalize(message.text) if resolver else message.text,
+                    original_text=message.original_text if message.original_text is not None else message.text)
+                arguments = text[len(alias):].strip()
                 reply = await self._invoke_handler(name, command.handler, Context(
-                    message, command.text, text[len(alias):].strip(),
+                    normalized, command.text, resolver.normalize(arguments) if resolver else arguments,
                     PluginServices(self, name)))
                 for response in reply if isinstance(reply, list) else ([] if reply is None else [reply]):
                     await self.deliver(name, response, message)
@@ -375,7 +392,8 @@ class Runtime:
         try:
             if self._closing:
                 raise RuntimeError("runtime is stopping")
-            for part in chunks(response.text, self.byte_limit):
+            text = self.normalize_mentions(response.text, interface)
+            for part in chunks(text, self.byte_limit):
                 try:
                     async with asyncio.timeout(self.send_timeout):
                         await self.transport.send(part, destination, channel, interface)
