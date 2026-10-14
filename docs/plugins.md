@@ -174,7 +174,10 @@ overlapping a still-running worker thread.
 Management reports transport readiness at startup and transport/plugin health
 at shutdown. Meshtastic connection-loss notifications propagate from the SDK
 thread to the core's event loop, fail the transport monitor, and trigger orderly
-shutdown with a nonzero exit. Restart the process to establish a fresh radio
+shutdown with a nonzero exit. The TCP adapter also intercepts the SDK's internal
+reconnect hook, which can run after socket EOF or a write error without publishing
+connection loss. It stops the reader and reports failure instead of reconnecting
+while health still reports ready. Restart the process to establish a fresh radio
 connection. Shutdown stops new work and ingress, cancels and awaits all jobs
 and inbound handlers before running plugin stop hooks, then closes transport.
 Plugin storage remains available during stop hooks. Partially initialized radio

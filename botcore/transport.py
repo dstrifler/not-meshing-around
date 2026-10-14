@@ -163,6 +163,11 @@ class MeshtasticTransport:
     def _connect(self, factory, kwargs):
         interface = factory(connectNow=False, timeout=self.connect_timeout, **kwargs)
         self.interface = interface
+        if self.settings["type"] == "tcp":
+            # TCP EOF/write errors can invoke this SDK hook without publishing
+            # connection.lost. Fail the bot instead of silently reconnecting;
+            # install before connect(), which starts the SDK reader thread.
+            interface._reconnect = lambda: self._tcp_connection_lost(interface)
         try:
             if self._stop_worker.is_set():
                 raise ConnectionError("radio startup stopped")
@@ -183,6 +188,13 @@ class MeshtasticTransport:
                     interface.close()
                     if self.interface is interface:
                         self.interface = None
+
+    def _tcp_connection_lost(self, interface):
+        interface._wantExit = True
+        if not self._stopping:
+            self.connection_lost(interface)
+        # Stop the SDK reader on EOF and propagate failure to a writing worker.
+        raise ConnectionError("radio connection lost")
 
     @staticmethod
     def _interrupt_io(interface):
