@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
+REAL_SUBPROCESS_RUN = subprocess.run
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('installer_tests_module', ROOT / 'scripts/install.py')
 installer = importlib.util.module_from_spec(spec)
@@ -131,6 +132,7 @@ class InstallerValidationTests(unittest.TestCase):
         self.assertIn('User=botuser\nGroup=botgroup\nSupplementaryGroups=dialout', unit)
         self.assertIn('NoNewPrivileges=true', unit)
         self.assertIn('ReadWritePaths=', unit)
+        self.assertIn(installer.unit_quote(self.prefix / '.cache'), unit)
         self.assertNotIn('meshtasticd', unit)
         self.assertNotIn('ProtectHome=true', unit)
         self.assertNotIn('PrivateTmp=true', unit)
@@ -179,6 +181,7 @@ class InstallerFlowTests(unittest.TestCase):
         self.user = SimpleNamespace(pw_uid=900, pw_gid=901, pw_shell='/usr/sbin/nologin')
         self.group = SimpleNamespace(gr_gid=901)
         self.commands = []
+        self.ownership = {}
         self.loaded = ''
         self.fail_pip = False
         self.fail_check = False
@@ -186,7 +189,7 @@ class InstallerFlowTests(unittest.TestCase):
                    patch.object(installer, 'validate_accounts', return_value=(None, None)),
                    patch.object(installer.pwd, 'getpwnam', return_value=self.user),
                    patch.object(installer.grp, 'getgrnam', return_value=self.group),
-                   patch.object(installer.os, 'chown'),
+                   patch.object(installer.os, 'chown', side_effect=self.record_ownership),
                    patch.object(installer.subprocess, 'run', return_value=SimpleNamespace(returncode=0)),
                    patch.object(installer, 'service_fragment', side_effect=lambda: self.loaded),
                    patch.object(installer, 'run', side_effect=self.command_stub)]
@@ -202,11 +205,22 @@ class InstallerFlowTests(unittest.TestCase):
             if not binary.exists():
                 binary.write_text('#!/bin/sh\nexit 0\n')
                 binary.chmod(0o755)
+                # Files produced by the simulated runuser command inherit its identity.
+                self.record_ownership(binary.parent, self.user.pw_uid, self.group.gr_gid)
+                self.record_ownership(binary, self.user.pw_uid, self.group.gr_gid)
         if self.fail_pip and 'install' in args and 'pip' in args:
             raise subprocess.CalledProcessError(1, args)
         if self.fail_check and '--check' in args:
             raise subprocess.CalledProcessError(1, args)
         return SimpleNamespace(returncode=0)
+
+    def record_ownership(self, path, uid, gid, **kwargs):
+        self.ownership[Path(path).absolute()] = (uid, gid)
+
+    def assert_installation_owner(self):
+        for path in (self.prefix, *self.prefix.rglob('*')):
+            with self.subTest(path=path):
+                self.assertEqual(self.ownership.get(path.absolute()), (self.user.pw_uid, self.group.gr_gid))
 
     def install(self):
         config = self.prefix / 'bot.toml' if (self.prefix / 'bot.toml').is_file() else ROOT / 'bot.toml'
@@ -226,6 +240,22 @@ class InstallerFlowTests(unittest.TestCase):
         self.assertIn(('systemctl', 'enable', installer.SERVICE), self.commands)
         self.assertIn(('systemctl', 'restart', installer.SERVICE), self.commands)
         self.assertIn('User=botuser', installer.UNIT_PATH.read_text())
+        self.assert_installation_owner()
+        # Only the unit outside the installation remains owned by root.
+        self.assertTrue(any(path.parent == self.root and owner == (0, 0)
+                            for path, owner in self.ownership.items()))
+
+    def test_rerun_repairs_ownership_of_existing_nested_files_and_cache(self):
+        self.install()
+        for path in (self.prefix / '.cache/pip/old-cache', self.prefix / 'custom/nested/file'):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('preserve')
+        for path in (self.prefix, *self.prefix.rglob('*')):
+            self.ownership[path.absolute()] = (0, 0)
+        self.install()
+        self.assert_installation_owner()
+        self.assertEqual((self.prefix / 'custom/nested/file').read_text(), 'preserve')
+        self.assertEqual((self.prefix / '.cache/pip/old-cache').read_text(), 'preserve')
 
     def test_rerun_preserves_database_and_plugin_settings_and_backs_up_radio_changes(self):
         self.install()
@@ -245,6 +275,36 @@ class InstallerFlowTests(unittest.TestCase):
         self.assertIn(('systemctl', 'stop', installer.SERVICE), self.commands)
         self.assertEqual(installer.read_config(config_path)['radio']['hostname'], 'radio.local')
 
+    @unittest.skipIf(importlib.util.find_spec('pip') is None, 'Requires Python with pip')
+    def test_real_pip_uses_owned_cache_instead_of_unwritable_external_default(self):
+        self.install()
+        command = next(command for command in self.commands if 'pip' in command and command[-1] == 'check')
+        arguments = list(command[command.index('--') + 1:])
+        arguments[0] = sys.executable  # Use real pip rather than the flow test's fake interpreter.
+        cache = self.root / 'unwritable-cache'
+        cache.mkdir(mode=0o555)
+        environment = os.environ | {'PIP_CACHE_DIR': str(cache), 'PIP_CONFIG_FILE': os.devnull}
+        environment.pop('PIP_NO_CACHE_DIR', None)
+        result = REAL_SUBPROCESS_RUN(arguments, cwd=self.prefix, capture_output=True, text=True,
+                                     env=environment, timeout=30)
+        self.assertIn(result.returncode, (0, 1), result.stderr)  # check can report unrelated package conflicts.
+        self.assertNotIn('cache has been disabled', result.stderr)
+        self.assertEqual(list(cache.iterdir()), [])
+        selected_cache = REAL_SUBPROCESS_RUN(arguments[:-1] + ['cache', 'dir'], cwd=self.prefix,
+                                            capture_output=True, text=True, env=environment, timeout=30)
+        self.assertEqual(selected_cache.returncode, 0, selected_cache.stderr)
+        self.assertEqual(Path(selected_cache.stdout.strip()), self.prefix / '.cache/pip')
+
+    def test_service_account_owns_cache_and_tree_before_dependency_operations(self):
+        original = self.command_stub
+        def check_owner(*args, **kwargs):
+            if 'pip' in args:
+                self.assert_installation_owner()
+                self.assertTrue((self.prefix / '.cache/pip').is_dir())
+            return original(*args, **kwargs)
+        with patch.object(installer, 'run', side_effect=check_owner):
+            self.install()
+
     def test_failed_venv_install_remains_resumable_and_never_enables_or_starts_service(self):
         self.fail_pip = True
         with self.assertRaises(subprocess.CalledProcessError):
@@ -253,6 +313,7 @@ class InstallerFlowTests(unittest.TestCase):
         self.assertFalse(installer.UNIT_PATH.exists())
         self.assertNotIn(('systemctl', 'enable', installer.SERVICE), self.commands)
         self.assertNotIn(('systemctl', 'restart', installer.SERVICE), self.commands)
+        self.assert_installation_owner()
         self.fail_pip = False
         self.install()
         self.assertTrue(installer.UNIT_PATH.exists())
@@ -283,6 +344,7 @@ class InstallerFlowTests(unittest.TestCase):
         self.install()
         self.assertEqual(external.stat().st_mode & 0o777, 0o700)
         self.assertEqual(external.read_text(), 'unchanged')
+        self.assertNotIn(external, self.ownership)
 
     def test_nested_symlinks_in_managed_state_are_not_followed(self):
         self.install()

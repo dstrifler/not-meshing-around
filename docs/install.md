@@ -48,11 +48,20 @@ as the selected user and group, independently of the person installing it.
 The installation contains the runtime, enabled plugin pairs, configuration,
 documentation, and a freshly created `venv/`; it excludes Git history, tests,
 the archived original bot, and the checkout's virtual environment. Python packages
-are installed as the service account. Code and the venv are then owned by root,
-readable by the service group, and not writable by the service account. Bot state
-is owned by that account under the configured data directory. Systemd also mounts
-the filesystem read-only for the service except its data directory and normal
-virtual filesystems.
+are installed as the service account. The selected user and group own the entire
+installation tree recursively: its root directory, code, configuration and backups,
+plugins, venv, data, and `.cache/pip`. Reruns repair existing ownership before pip
+runs and reapply it after dependency installation and bot validation, including
+when those checks fail. Venv symlink targets outside the installation are untouched.
+The systemd unit in `/etc/systemd/system` remains owned by root.
+
+Both dependency installation and `pip check` explicitly use the service-owned
+`<installation>/.cache/pip`, so downloads and built wheels can be reused on later
+installs. This also works when reusing an account whose home directory is elsewhere.
+Updating the checkout and rerunning the installer repairs the cache ownership of
+earlier installations. Systemd retains a read-only filesystem for the running bot
+except its data and `.cache` directories and normal virtual filesystems; this is
+independent of the installation's on-disk ownership.
 
 Installation paths with spaces and systemd metacharacters are escaped. A destination
 under a private home directory receives narrowly scoped traversal ACLs on otherwise
@@ -60,8 +69,8 @@ inaccessible parents, without granting directory listing or write access. The
 service does not hide home directories. Use a dedicated installation directory;
 the installer refuses unrelated nonempty directories and unrelated existing
 `meshbot.service` units. Installing into the checkout root itself is supported,
-but makes its installed runtime files root-owned; a separate checkout is easier
-to update with normal Git commands.
+but transfers ownership of that tree to the service account; a separate checkout
+is easier to update with normal Git commands.
 
 For installer-managed layouts, `core.plugins` and `core.database` must resolve
 inside the installation directory. The database needs a separate data directory

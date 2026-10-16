@@ -211,7 +211,7 @@ def validate_destination(options, source):
     if UNIT_PATH.exists() and not UNIT_PATH.read_text().startswith(MANAGED + json.dumps(str(prefix)) + '\n'):
         raise ValueError(f'{UNIT_PATH} already belongs to another installation or service.')
     # These trees are managed as code or bot-owned data; never follow links out.
-    for name in ('bot.toml', 'venv', 'botcore', 'plugins.d', 'scripts', MARKER):
+    for name in ('bot.toml', 'venv', 'botcore', 'plugins.d', 'scripts', '.cache', MARKER):
         path = prefix / name
         if path.is_symlink():
             raise ValueError(f'Installer-managed paths must not be symlinks: {path}')
@@ -278,7 +278,7 @@ def render_unit(options, data):
             'Restart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=90\n'
             'UMask=0027\nNoNewPrivileges=true\nProtectSystem=strict\n'
             'ProtectKernelTunables=true\nProtectControlGroups=true\nRestrictSUIDSGID=true\n'
-            f'ReadWritePaths={unit_quote(data)}\n\n[Install]\nWantedBy=multi-user.target\n')
+            f'ReadWritePaths={unit_quote(data)} {unit_quote(prefix / ".cache")}\n\n[Install]\nWantedBy=multi-user.target\n')
 
 
 def reject_links(path):
@@ -304,7 +304,7 @@ def own_tree(path, uid, gid, *, code=False):
                 file.chmod(0o640)
 
 
-def write_owned(path, text, gid, mode=0o640):
+def write_owned(path, text, uid, gid, mode=0o640):
     if path.is_symlink():
         raise ValueError(f'Refusing to replace a symlink: {path}')
     with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as stream:
@@ -312,7 +312,7 @@ def write_owned(path, text, gid, mode=0o640):
         try:
             stream.write(text)
             stream.flush()
-            os.chown(temporary, 0, gid)
+            os.chown(temporary, uid, gid)
             temporary.chmod(mode)
             os.replace(temporary, path)
         finally:
@@ -330,12 +330,12 @@ def stage_runtime(source, stage):
             shutil.copy2(path, stage / name)
 
 
-def deploy_runtime(stage, prefix, plugins, gid):
+def deploy_runtime(stage, prefix, plugins, uid, gid):
     for name in ('botcore', 'scripts', 'docs'):
         target = prefix / name
         reject_links(target)
         shutil.copytree(stage / name, target, dirs_exist_ok=True)
-        own_tree(target, 0, gid, code=True)
+        own_tree(target, uid, gid, code=True)
     plugins.mkdir(parents=True, exist_ok=True)
     reject_links(plugins)
     for source in (stage / 'plugins.d').iterdir():
@@ -344,15 +344,25 @@ def deploy_runtime(stage, prefix, plugins, gid):
             continue
         if source.is_file() and source.suffix in ('.py', '.toml'):
             shutil.copy2(source, target)
-    own_tree(plugins, 0, gid, code=True)
+    own_tree(plugins, uid, gid, code=True)
     for name in ('mesh_bot.py', 'requirements.txt', 'launch.sh', 'bootstrap.sh', 'install.sh', 'README.md', 'LICENSE.md'):
         target = prefix / name
         if target.is_symlink():
             raise ValueError(f'Refusing to replace a symlink: {target}')
         shutil.copy2(stage / name, target)
-        os.chown(target, 0, gid)
+        os.chown(target, uid, gid)
         target.chmod(0o750 if name.endswith('.sh') else 0o640)
-    write_owned(prefix / 'bot.toml.dist', (stage / 'bot.toml').read_text(), gid)
+    write_owned(prefix / 'bot.toml.dist', (stage / 'bot.toml').read_text(), uid, gid)
+
+
+def own_installation(prefix, uid, gid):
+    """Repair the whole installation, including old files, without following links."""
+    def traversal_failed(error):
+        raise error
+    for root, directories, files in os.walk(prefix, followlinks=False, onerror=traversal_failed):
+        os.chown(root, uid, gid, follow_symlinks=False)
+        for name in (*directories, *files):
+            os.chown(Path(root) / name, uid, gid, follow_symlinks=False)
 
 
 def grant_traversal(parent, user):
@@ -375,6 +385,9 @@ def install(options, config, source):
         reject_links(plugins)
     if data.exists():
         reject_links(data)
+    cache_root = options.prefix / '.cache'
+    if cache_root.exists():
+        reject_links(cache_root)
     loaded = service_fragment()
     if loaded and Path(loaded) != UNIT_PATH:
         raise ValueError(f'{SERVICE} already exists at {loaded}; it will not be overwritten.')
@@ -396,17 +409,17 @@ def install(options, config, source):
         prefix.mkdir(parents=True, exist_ok=True)
         if loaded:
             run('systemctl', 'stop', SERVICE)
-        os.chown(prefix, 0, group.gr_gid)
+        os.chown(prefix, user.pw_uid, group.gr_gid)
         prefix.chmod(0o750)
         # Record the destination before copying/building so failed first installs
         # can be resumed without treating their partial files as unrelated data.
-        write_owned(prefix / MARKER, json.dumps({'version': 1, 'user': options.user, 'group': options.group}, indent=2) + '\n', group.gr_gid)
+        write_owned(prefix / MARKER, json.dumps({'version': 1, 'user': options.user, 'group': options.group}, indent=2) + '\n', user.pw_uid, group.gr_gid)
         # An installation below a private home needs traversal, not directory listing.
         for parent in reversed(prefix.parents):
             accessible = subprocess.run(['runuser', '-u', options.user, '--', 'test', '-x', str(parent)]).returncode == 0
             if not accessible:
                 grant_traversal(parent, options.user)
-        deploy_runtime(stage, prefix, plugins, group.gr_gid)
+        deploy_runtime(stage, prefix, plugins, user.pw_uid, group.gr_gid)
         data.mkdir(parents=True, exist_ok=True)
         own_tree(data, user.pw_uid, group.gr_gid)
         config_path = prefix / 'bot.toml'
@@ -414,36 +427,30 @@ def install(options, config, source):
             if config_path.exists():
                 backup = prefix / ('bot.toml.before-install-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
                 shutil.copy2(config_path, backup)
-                os.chown(backup, 0, group.gr_gid)
+                os.chown(backup, user.pw_uid, group.gr_gid)
                 backup.chmod(0o640)
-            write_owned(config_path, config_text, group.gr_gid)
-        os.chown(config_path, 0, group.gr_gid)
+            write_owned(config_path, config_text, user.pw_uid, group.gr_gid)
+        os.chown(config_path, user.pw_uid, group.gr_gid)
         config_path.chmod(0o640)
         venv = prefix / 'venv'
         venv.mkdir(exist_ok=True)
-        # Build packages as the service account, then make executable code read-only to it.
-        # venv/bin contains interpreter symlinks, so chown never follows those links.
-        def own_venv(uid):
-            for root, directories, files in os.walk(venv, followlinks=False):
-                os.chown(root, uid, group.gr_gid)
-                Path(root).chmod(0o750)
-                for name in (*directories, *files):
-                    path = Path(root) / name
-                    os.chown(path, uid, group.gr_gid, follow_symlinks=False)
-                    if not path.is_symlink():
-                        path.chmod(0o750 if path.is_dir() or path.stat().st_mode & 0o111 else 0o640)
-        own_venv(user.pw_uid)
+        cache = cache_root / 'pip'
+        cache.mkdir(parents=True, exist_ok=True)
+        own_installation(prefix, user.pw_uid, group.gr_gid)
         try:
             run('runuser', '-u', options.user, '--', sys.executable, '-m', 'venv', venv, cwd=prefix)
             python = venv / 'bin/python'
-            run('runuser', '-u', options.user, '--', python, '-m', 'pip', 'install', '--no-cache-dir',
-                '--disable-pip-version-check', '-r', prefix / 'requirements.txt', cwd=prefix)
-            run('runuser', '-u', options.user, '--', python, '-m', 'pip', 'check', cwd=prefix)
+            # An explicit cache also works when reusing an account whose home
+            # directory differs from this installation's location.
+            pip = ('runuser', '-u', options.user, '--', python, '-m', 'pip',
+                   '--cache-dir', cache, '--disable-pip-version-check')
+            run(*pip, 'install', '-r', prefix / 'requirements.txt', cwd=prefix)
+            run(*pip, 'check', cwd=prefix)
+            run('runuser', '-u', options.user, '--', venv / 'bin/python', prefix / 'mesh_bot.py',
+                '--config', config_path, '--check', cwd=prefix)
         finally:
-            own_venv(0)
-        run('runuser', '-u', options.user, '--', venv / 'bin/python', prefix / 'mesh_bot.py',
-            '--config', config_path, '--check', cwd=prefix)
-        write_owned(UNIT_PATH, render_unit(options, data), 0, 0o644)
+            own_installation(prefix, user.pw_uid, group.gr_gid)
+        write_owned(UNIT_PATH, render_unit(options, data), 0, 0, 0o644)
         run('systemctl', 'daemon-reload')
         run('systemctl', 'enable', SERVICE)
         run('systemctl', 'reset-failed', SERVICE)
