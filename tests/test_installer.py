@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
+REAL_SUBPROCESS_RUN = subprocess.run
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('installer_tests_module', ROOT / 'scripts/install.py')
 installer = importlib.util.module_from_spec(spec)
@@ -244,6 +245,23 @@ class InstallerFlowTests(unittest.TestCase):
         self.assertEqual(next(self.prefix.glob('bot.toml.before-install-*')).read_text(), original)
         self.assertIn(('systemctl', 'stop', installer.SERVICE), self.commands)
         self.assertEqual(installer.read_config(config_path)['radio']['hostname'], 'radio.local')
+
+    @unittest.skipIf(os.geteuid() == 0 or importlib.util.find_spec('pip') is None,
+                     'Requires an unprivileged Python environment with pip')
+    def test_real_dependency_check_does_not_use_an_unwritable_cache(self):
+        self.install()
+        command = next(command for command in self.commands if 'pip' in command and command[-1] == 'check')
+        arguments = list(command[command.index('--') + 1:])
+        arguments[0] = sys.executable  # Use real pip rather than the flow test's fake interpreter.
+        cache = self.root / 'unwritable-cache'
+        cache.mkdir(mode=0o555)
+        environment = os.environ | {'PIP_CACHE_DIR': str(cache), 'PIP_CONFIG_FILE': os.devnull}
+        environment.pop('PIP_NO_CACHE_DIR', None)  # The generated CLI must supply the fix itself.
+        result = REAL_SUBPROCESS_RUN(arguments, cwd=self.prefix, capture_output=True, text=True,
+                                     env=environment, timeout=30)
+        self.assertIn(result.returncode, (0, 1), result.stderr)  # check can report unrelated package conflicts.
+        self.assertNotIn('cache has been disabled', result.stderr)
+        self.assertEqual(list(cache.iterdir()), [])
 
     def test_failed_venv_install_remains_resumable_and_never_enables_or_starts_service(self):
         self.fail_pip = True

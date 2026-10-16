@@ -54,6 +54,11 @@ is owned by that account under the configured data directory. Systemd also mount
 the filesystem read-only for the service except its data directory and normal
 virtual filesystems.
 
+Both dependency installation and `pip check` disable pip caching. The account's
+home is the root-owned installation directory, so pip must not try to create
+`.cache/pip` there. A cache warning from an earlier installer does not mean the
+installation failed; updating the checkout and rerunning the installer removes it.
+
 Installation paths with spaces and systemd metacharacters are escaped. A destination
 under a private home directory receives narrowly scoped traversal ACLs on otherwise
 inaccessible parents, without granting directory listing or write access. The

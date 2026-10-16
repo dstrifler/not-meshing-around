@@ -436,9 +436,12 @@ def install(options, config, source):
         try:
             run('runuser', '-u', options.user, '--', sys.executable, '-m', 'venv', venv, cwd=prefix)
             python = venv / 'bin/python'
-            run('runuser', '-u', options.user, '--', python, '-m', 'pip', 'install', '--no-cache-dir',
-                '--disable-pip-version-check', '-r', prefix / 'requirements.txt', cwd=prefix)
-            run('runuser', '-u', options.user, '--', python, '-m', 'pip', 'check', cwd=prefix)
+            # The account's home is the root-owned install directory. Both pip
+            # operations must avoid its unwritable cache, including pip check.
+            pip = ('runuser', '-u', options.user, '--', python, '-m', 'pip',
+                   '--no-cache-dir', '--disable-pip-version-check')
+            run(*pip, 'install', '-r', prefix / 'requirements.txt', cwd=prefix)
+            run(*pip, 'check', cwd=prefix)
         finally:
             own_venv(0)
         run('runuser', '-u', options.user, '--', venv / 'bin/python', prefix / 'mesh_bot.py',
