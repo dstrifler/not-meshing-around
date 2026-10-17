@@ -557,11 +557,42 @@ def stage_runtime(source, stage):
             shutil.copy2(path, stage / name)
 
 
-def deploy_runtime(stage, prefix, plugins, uid, gid):
+def copy_owned(source, target, uid, gid, mode):
+    """Replace a complete file atomically; a failed copy leaves its predecessor."""
+    source, target = Path(source), Path(target)
+    if target.is_symlink():
+        raise ValueError(f'Refusing to replace a symlink: {target}')
+    with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.meshbot-copy-', delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            with source.open('rb') as incoming:
+                shutil.copyfileobj(incoming, stream)
+            stream.flush()
+            os.fchown(stream.fileno(), uid, gid)
+            os.fchmod(stream.fileno(), mode)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return target
+
+
+def deploy_runtime(stage, prefix, plugins, uid, gid, record):
+    def copy_runtime(source, target, mode=None):
+        if mode is None:
+            mode = 0o750 if Path(source).stat().st_mode & 0o111 else 0o640
+        copy_owned(source, target, uid, gid, mode)
+        relative = str(Path(target).relative_to(prefix))
+        # The root manifest already knows the pending hash. If interrupted
+        # after replace but before this save, uninstall accepts either version.
+        record['files'][relative] = record['pending_files'].pop(relative)
+        record['runtime_sha256'] = inventory_digest(record['files'])
+        save_manifest(record)
+        return target
+
     for name in ('botcore', 'scripts', 'docs'):
         target = prefix / name
         reject_links(target)
-        shutil.copytree(stage / name, target, dirs_exist_ok=True)
+        shutil.copytree(stage / name, target, dirs_exist_ok=True, copy_function=copy_runtime)
         own_tree(target, uid, gid, code=True)
     plugins.mkdir(parents=True, exist_ok=True)
     reject_links(plugins)
@@ -570,16 +601,14 @@ def deploy_runtime(stage, prefix, plugins, uid, gid):
         if source.suffix == '.toml' and target.exists():
             continue
         if source.is_file() and source.suffix in ('.py', '.toml'):
-            shutil.copy2(source, target)
+            copy_owned(source, target, uid, gid, 0o750 if source.stat().st_mode & 0o111 else 0o640)
     own_tree(plugins, uid, gid, code=True)
     for name in ('mesh_bot.py', 'requirements.txt', 'launch.sh', 'bootstrap.sh', 'install.sh', 'README.md', 'LICENSE.md'):
         target = prefix / name
         if target.is_symlink():
             raise ValueError(f'Refusing to replace a symlink: {target}')
-        shutil.copy2(stage / name, target)
-        os.chown(target, uid, gid)
-        target.chmod(0o750 if name.endswith('.sh') else 0o640)
-    write_owned(prefix / 'bot.toml.dist', (stage / 'bot.toml').read_text(), uid, gid)
+        copy_runtime(stage / name, target, 0o750 if name.endswith('.sh') else 0o640)
+    copy_runtime(stage / 'bot.toml', prefix / 'bot.toml.dist', 0o640)
 
 
 def own_installation(prefix, uid, gid):
@@ -623,17 +652,19 @@ def read_manifest():
     if (not isinstance(record, dict) or record.get('version') != INSTALLER_VERSION
             or record.get('service') != str(UNIT_PATH)
             or not isinstance(record.get('files'), dict)
+            or not isinstance(record.get('pending_files', {}), dict)
             or any(not isinstance(record.get(key), str) for key in ('prefix', 'user', 'group', 'plugins', 'data'))
             or record.get('status') not in ('installing', 'installed', 'uninstalled', 'purged')):
         raise ValueError('Unrecognized root-owned installation inventory.')
     prefix = install_path(record['prefix'])
     if str(prefix) != record['prefix']:
         raise ValueError('Installation directory has changed through a symlink; refusing removal.')
-    for name, digest in record['files'].items():
-        relative_path(name)
-        if (Path(name).parts[0] not in (*RUNTIME_FILES, 'bot.toml.dist', 'botcore', 'scripts', 'docs')
-                or not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest)):
-            raise ValueError('Invalid file inventory.')
+    for entries in (record['files'], record.get('pending_files', {})):
+        for name, digest in entries.items():
+            relative_path(name)
+            if (Path(name).parts[0] not in (*RUNTIME_FILES, 'bot.toml.dist', 'botcore', 'scripts', 'docs')
+                    or not isinstance(digest, str) or not re.fullmatch('[0-9a-f]{64}', digest)):
+                raise ValueError('Invalid file inventory.')
     for name in (record['plugins'], record['data']):
         relative_path(name)
     account_name(record['user'])
@@ -646,20 +677,32 @@ def save_manifest(record):
     write_owned(STATE / MANIFEST, json.dumps(record, indent=2) + '\n', 0, 0, 0o644)
 
 
+def inventory_digest(files):
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+
 def inventory(stage, options, plugins, data, previous):
     files = dict(previous['files']) if previous else {}
+    # A prior interrupted update may have replaced a file before saving its
+    # deployed hash. Promote only a match to that trusted pending candidate;
+    # never adopt locally modified bytes as installer-owned content.
+    previous_pending = previous.get('pending_files', {}) if previous else {}
+    for relative, digest in previous_pending.items():
+        if current_file_hash(options.prefix, relative) == digest:
+            files[relative] = digest
+    pending = {}
     for name in (*RUNTIME_FILES, 'botcore', 'scripts', 'docs'):
         path = stage / name
         sources = sorted(path.rglob('*')) if path.is_dir() else [path]
         for source in sources:
             if source.is_file():
-                files[str(source.relative_to(stage))] = hashlib.sha256(source.read_bytes()).hexdigest()
-    files['bot.toml.dist'] = hashlib.sha256((stage / 'bot.toml').read_bytes()).hexdigest()
+                pending[str(source.relative_to(stage))] = hashlib.sha256(source.read_bytes()).hexdigest()
+    pending['bot.toml.dist'] = hashlib.sha256((stage / 'bot.toml').read_bytes()).hexdigest()
     return {'version': INSTALLER_VERSION, 'prefix': str(options.prefix), 'service': str(UNIT_PATH),
             'user': options.user, 'group': options.group,
             'plugins': str(plugins.relative_to(options.prefix)), 'data': str(data.relative_to(options.prefix)),
-            'files': files, 'status': 'installing',
-            'runtime_sha256': hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest(),
+            'files': files, 'pending_files': pending, 'status': 'installing',
+            'runtime_sha256': inventory_digest(files), 'target_runtime_sha256': inventory_digest(pending),
             'updated': datetime.datetime.now().astimezone().isoformat()}
 
 
@@ -681,14 +724,26 @@ def removal_parent(prefix, relative):
             os.close(descriptor)
 
 
-def remove_recorded_file(prefix, relative, digest=None):
+def current_file_hash(prefix, relative):
     try:
         with removal_parent(prefix, relative) as (parent, name):
             descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             with os.fdopen(descriptor, 'rb') as stream:
                 if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                     raise ValueError(f'Refusing non-regular file: {relative}')
-                matches = digest is None or hashlib.file_digest(stream, 'sha256').hexdigest() == digest
+                return hashlib.file_digest(stream, 'sha256').hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def remove_recorded_file(prefix, relative, digests=None):
+    try:
+        with removal_parent(prefix, relative) as (parent, name):
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            with os.fdopen(descriptor, 'rb') as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError(f'Refusing non-regular file: {relative}')
+                matches = digests is None or hashlib.file_digest(stream, 'sha256').hexdigest() in digests
             if matches:
                 os.unlink(name, dir_fd=parent)
                 if ACTIVE_LOG:
@@ -765,8 +820,10 @@ def uninstall(plan):
     run('systemctl', 'daemon-reload')
     progress(2, 4, 'Removing recorded runtime files')
     if record:
-        for relative, digest in record['files'].items():
-            remove_recorded_file(prefix, relative, digest)
+        recorded = record['files'].keys() | record.get('pending_files', {}).keys()
+        for relative in sorted(recorded):
+            candidates = {record['files'].get(relative), record.get('pending_files', {}).get(relative)} - {None}
+            remove_recorded_file(prefix, relative, candidates)
         for relative in ('venv', '.cache'):
             remove_recorded_tree(prefix, relative)
         progress(3, 4, 'Removing configuration and data' if plan['purge'] else 'Preserving configuration, plugins, and data')
@@ -775,7 +832,7 @@ def uninstall(plan):
                 remove_recorded_tree(prefix, relative)
             for relative in ('bot.toml', MARKER, *(path.name for path in prefix.glob('bot.toml.before-install-*'))):
                 remove_recorded_file(prefix, relative)
-        directories = {str(parent) for relative in record['files'] for parent in Path(relative).parents if str(parent) != '.'}
+        directories = {str(parent) for relative in recorded for parent in Path(relative).parents if str(parent) != '.'}
         for relative in sorted(directories, key=lambda value: len(Path(value).parts), reverse=True):
             try:
                 with removal_parent(prefix, relative) as (parent, name):
@@ -876,7 +933,7 @@ def install(options, config, source, *, dependencies=None, automatic=False):
             if not accessible:
                 grant_traversal(parent, options.user)
         progress(4, 7, 'Installing runtime and preserving operator configuration')
-        deploy_runtime(stage, prefix, plugins, user.pw_uid, group.gr_gid)
+        deploy_runtime(stage, prefix, plugins, user.pw_uid, group.gr_gid, record)
         data.mkdir(parents=True, exist_ok=True)
         own_tree(data, user.pw_uid, group.gr_gid)
         config_path = prefix / 'bot.toml'
@@ -933,7 +990,8 @@ def show_plan(plan, verbose=False):
         record = plan['record']
         print(f"\nUninstall: {plan['prefix']}\nService: {UNIT_PATH}")
         if record:
-            print(f"Remove: {len(record['files'])} recorded runtime files if unchanged, venv, and pip cache.")
+            count = len(record['files'].keys() | record.get('pending_files', {}).keys())
+            print(f"Remove: {count} recorded runtime files if unchanged, venv, and pip cache.")
             print('Keep: modified/unknown files, system accounts, traversal ACLs, OS packages, and installation logs.')
             print(('PURGE: remove bot.toml/backups, plugin directory (including custom plugins), and data directory.'
                    if plan['purge'] else 'Keep: bot.toml/backups, all plugins, and persistent data. Use --purge to remove these.'))

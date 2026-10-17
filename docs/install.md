@@ -228,6 +228,11 @@ The inventory lives at `/var/lib/meshbot-installer/installation.json`, outside t
 service-owned tree. It records file hashes, paths, account creation information,
 package transaction/pre-existing requirements, runtime digest, and installation
 status. It is written before deployment so interrupted installs remain removable.
+Deployed hashes remain authoritative during an update; planned replacements have
+separate pending hashes. Runtime files are replaced atomically, then each deployed
+hash is committed. If interruption lands between replacement and that commit,
+uninstall accepts either known version. A retry recovers only pending hashes that
+match the file actually on disk; it does not adopt locally modified content.
 The service-owned `.meshbot-install.json` remains only a reinstall/defaults marker;
 it does not authorize root file deletion.
 

@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 
 REAL_SUBPROCESS_RUN = subprocess.run
+REAL_OS_REPLACE = os.replace
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('installer_tests_module', ROOT / 'scripts/install.py')
 installer = importlib.util.module_from_spec(spec)
@@ -198,6 +199,8 @@ class InstallerFlowTests(unittest.TestCase):
                    patch.object(installer.pwd, 'getpwnam', return_value=self.user),
                    patch.object(installer.grp, 'getgrnam', return_value=self.group),
                    patch.object(installer.os, 'chown', side_effect=self.record_ownership),
+                   patch.object(installer.os, 'fchown', side_effect=self.record_descriptor_ownership),
+                   patch.object(installer.os, 'replace', side_effect=self.replace_ownership),
                    patch.object(installer.subprocess, 'run', return_value=SimpleNamespace(returncode=0)),
                    patch.object(installer, 'service_fragment', side_effect=lambda: self.loaded),
                    patch.object(installer, 'run', side_effect=self.command_stub)]
@@ -224,6 +227,15 @@ class InstallerFlowTests(unittest.TestCase):
 
     def record_ownership(self, path, uid, gid, **kwargs):
         self.ownership[Path(path).absolute()] = (uid, gid)
+
+    def record_descriptor_ownership(self, descriptor, uid, gid):
+        self.record_ownership(os.readlink(f'/proc/self/fd/{descriptor}'), uid, gid)
+
+    def replace_ownership(self, source, target):
+        REAL_OS_REPLACE(source, target)
+        owner = self.ownership.pop(Path(source).absolute(), None)
+        if owner is not None:
+            self.ownership[Path(target).absolute()] = owner
 
     def assert_installation_owner(self):
         for path in (self.prefix, *self.prefix.rglob('*')):
@@ -524,6 +536,128 @@ class InstallerFlowTests(unittest.TestCase):
         self.assertFalse(installer.UNIT_PATH.exists())
         self.assertTrue((self.prefix / 'mesh_bot.py').exists())
         self.assertTrue((self.prefix / 'venv').exists())
+
+    def upgraded_source(self, version):
+        source = self.root / f'source-v{version}'
+        source.mkdir()
+        installer.stage_runtime(ROOT, source)
+        for relative in ('botcore/runtime.py', 'mesh_bot.py'):
+            target = source / relative
+            target.write_text(target.read_text() + f'\n# runtime version {version}\n')
+        (source / 'botcore/new_feature.py').write_text(f'# added in version {version}\n')
+        return source
+
+    def test_update_failure_before_copy_keeps_old_deployed_hashes_authoritative(self):
+        self.install()
+        previous = installer.read_manifest()
+        before = (self.prefix / 'botcore/runtime.py').read_bytes()
+        source = self.upgraded_source(2)
+        with patch.object(installer.subprocess, 'run', return_value=SimpleNamespace(returncode=1)), \
+                patch.object(installer, 'grant_traversal', side_effect=PermissionError('ACL denied')):
+            with self.assertRaises(PermissionError):
+                installer.install(self.options, installer.read_config(self.prefix / 'bot.toml'), source)
+        record = installer.read_manifest()
+        self.assertEqual(record['files'], previous['files'])
+        self.assertEqual((self.prefix / 'botcore/runtime.py').read_bytes(), before)
+        self.assertNotEqual(record['pending_files']['botcore/runtime.py'], record['files']['botcore/runtime.py'])
+        installer.uninstall(installer.uninstall_plan())
+        self.assertFalse((self.prefix / 'botcore').exists())
+        self.assertFalse((self.prefix / 'mesh_bot.py').exists())
+
+    def test_interruption_after_atomic_replace_before_manifest_save_removes_both_versions(self):
+        self.install()
+        previous = installer.read_manifest()
+        source = self.upgraded_source(2)
+        (self.prefix / 'README.md').write_text('retain local edits')
+        original = installer.copy_owned
+
+        def interrupt(source_file, target, *args):
+            result = original(source_file, target, *args)
+            if Path(target) == self.prefix / 'botcore/runtime.py':
+                raise KeyboardInterrupt()
+            return result
+
+        with patch.object(installer, 'copy_owned', side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                installer.install(self.options, installer.read_config(self.prefix / 'bot.toml'), source)
+        record = installer.read_manifest()
+        self.assertEqual(record['files']['botcore/runtime.py'], previous['files']['botcore/runtime.py'])
+        self.assertEqual((self.prefix / 'botcore/runtime.py').read_bytes(), (source / 'botcore/runtime.py').read_bytes())
+        self.assertEqual(installer.current_file_hash(self.prefix, 'botcore/runtime.py'), record['pending_files']['botcore/runtime.py'])
+        self.assertEqual(installer.current_file_hash(self.prefix, 'mesh_bot.py'), previous['files']['mesh_bot.py'])
+        installer.uninstall(installer.uninstall_plan())
+        self.assertFalse((self.prefix / 'botcore').exists())
+        self.assertFalse((self.prefix / 'mesh_bot.py').exists())
+        self.assertEqual((self.prefix / 'README.md').read_text(), 'retain local edits')
+
+    def test_failed_file_copy_is_atomic_and_leaves_old_file_removable(self):
+        self.install()
+        previous = installer.read_manifest()
+        source = self.upgraded_source(2)
+        before = (self.prefix / 'botcore/runtime.py').read_bytes()
+        original = installer.shutil.copyfileobj
+
+        def fail_copy(incoming, outgoing, *args):
+            if (Path(incoming.name).name == 'runtime.py' and
+                    Path(outgoing.name).parent == self.prefix / 'botcore'):
+                outgoing.write(b'partial copy')
+                raise OSError('simulated copy failure')
+            return original(incoming, outgoing, *args)
+
+        with patch.object(installer.shutil, 'copyfileobj', side_effect=fail_copy):
+            with self.assertRaises(installer.shutil.Error):
+                installer.install(self.options, installer.read_config(self.prefix / 'bot.toml'), source)
+        self.assertEqual((self.prefix / 'botcore/runtime.py').read_bytes(), before)
+        self.assertEqual(installer.read_manifest()['files']['botcore/runtime.py'], previous['files']['botcore/runtime.py'])
+        self.assertEqual(list(self.prefix.rglob('.meshbot-copy-*')), [])
+        installer.uninstall(installer.uninstall_plan())
+        self.assertFalse((self.prefix / 'botcore').exists())
+
+    def test_retry_with_another_version_recovers_only_known_pending_content(self):
+        self.install()
+        original = installer.copy_owned
+        source = self.upgraded_source(2)
+
+        def interrupt(source_file, target, *args):
+            result = original(source_file, target, *args)
+            if Path(target) == self.prefix / 'botcore/runtime.py':
+                raise KeyboardInterrupt()
+            return result
+
+        with patch.object(installer, 'copy_owned', side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                installer.install(self.options, installer.read_config(self.prefix / 'bot.toml'), source)
+        second_hash = installer.current_file_hash(self.prefix, 'botcore/runtime.py')
+        (self.prefix / 'README.md').write_text('local change after interruption')
+        source = self.upgraded_source(3)
+        with patch.object(installer, 'deploy_runtime', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                installer.install(self.options, installer.read_config(self.prefix / 'bot.toml'), source)
+        record = installer.read_manifest()
+        self.assertEqual(record['files']['botcore/runtime.py'], second_hash)
+        self.assertNotEqual(record['pending_files']['botcore/runtime.py'], second_hash)
+        self.assertNotEqual(record['files']['README.md'], installer.current_file_hash(self.prefix, 'README.md'))
+        installer.uninstall(installer.uninstall_plan())
+        self.assertFalse((self.prefix / 'botcore').exists())
+        self.assertEqual((self.prefix / 'README.md').read_text(), 'local change after interruption')
+
+    def test_interrupted_first_deployment_removes_new_files_from_pending_inventory(self):
+        original = installer.copy_owned
+
+        def interrupt(source_file, target, *args):
+            result = original(source_file, target, *args)
+            if Path(target) == self.prefix / 'botcore/runtime.py':
+                raise KeyboardInterrupt()
+            return result
+
+        with patch.object(installer, 'copy_owned', side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.install()
+        record = installer.read_manifest()
+        self.assertNotIn('botcore/runtime.py', record['files'])
+        self.assertEqual(record['pending_files']['botcore/runtime.py'], installer.current_file_hash(self.prefix, 'botcore/runtime.py'))
+        installer.uninstall(installer.uninstall_plan())
+        self.assertFalse((self.prefix / 'botcore').exists())
 
     def test_changed_dependency_transaction_requires_reapproval_before_package_install(self):
         changed = installer.Dependencies(changes=(('extra-package', '', '1.0'),))
