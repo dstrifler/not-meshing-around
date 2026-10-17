@@ -483,11 +483,12 @@ class ManagementLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_transport_failure_triggers_management_shutdown(self):
         self.transport.run_error = ConnectionError("radio connection lost")
-        with self.assertRaisesRegex(ConnectionError, "connection lost"):
+        with self.assertLogs('botcore.controller', level='INFO') as logs, \
+                self.assertRaisesRegex(ConnectionError, "connection lost"):
             await self.run_controller()
         self.assertTrue(self.transport.closed)
         self.assertEqual(self.runtime.health()["p"]["status"], "stopped")
-        self.assertIn('"transport"', self.output.getvalue())
+        self.assertTrue(any('transport_final_state' in line for line in logs.output))
 
     async def test_check_runs_hooks_without_opening_transport_or_running_jobs(self):
         await self.run_controller(check=True)

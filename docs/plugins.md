@@ -158,6 +158,8 @@ Handlers and lifecycle hooks are asynchronous; blocking I/O belongs in
   `Message.original_text` retains the received text before normalization.
   Messages also provide optional normalized SNR, RSSI, noise floor, hop count,
   MQTT status, and local node name for diagnostics.
+  `packet_id` and `pki_encrypted` retain available radio metadata; `trace_id`
+  correlates request processing and delayed replies in logs.
   Return a `Response`, a list of responses, or `None`.
 - `Response(text)` follows the plugin's configured `reply_mode` for solicited
   responses. Core owns their audience and preserves their channel/interface.
@@ -191,6 +193,11 @@ Handlers and lifecycle hooks are asynchronous; blocking I/O belongs in
 
 Services provide `get(key, default)` and `set(key, JSON_serializable_value)` in
 plugin-scoped persistent SQLite state, `emit(Event(...))`, and `send(Response(...))`.
+`services.logger` supplies `debug`, `info`, `warning`, and `error` methods with
+an event name and keyword metadata; plugin identity and request correlation are
+automatic. Use `content=` for user-controlled message text so the global content
+setting applies, and never log credentials/key material. Management owns all
+destinations and formatting. See [logging](logging.md) for examples and controls.
 The event queue holds at most 256 waiting events. Emission never waits for queue
 space: it raises `botcore.api.EventQueueFull` immediately when full. Callers can
 catch that exception and drop or retry an event later. An uncaught overflow is

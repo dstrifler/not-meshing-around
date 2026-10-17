@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import json
 import sqlite3
 import subprocess
 import sys
@@ -262,10 +261,9 @@ def register(settings):
                 result = subprocess.run([sys.executable, "mesh_bot.py", "--config", str(root / "bot.toml"), "--check"],
                     cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 1 if rollback else 0, result.stderr)
-                health = json.loads(result.stdout.splitlines()[-1])
-                self.assertEqual(health["plugins"]["z_healthy"]["status"], "stopped")
-                self.assertEqual(health["plugins"]["a_broken"]["status"], "failed")
-                self.assertEqual(health["transport"]["status"], "stopped")
+                self.assertIn('plugin_final_state plugin=z_healthy status=stopped', result.stderr)
+                self.assertIn('plugin_final_state plugin=a_broken status=failed', result.stderr)
+                self.assertIn('transport_final_state status=stopped', result.stderr)
                 if rollback:
                     self.assertIn("startup cleanup cancelled", result.stderr)
                 with sqlite3.connect(root / "data/core.db") as database:

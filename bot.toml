@@ -23,3 +23,12 @@ admins = []
 blocked = []
 # Plugins allowed to send unsolicited channel messages or change reply audience.
 broadcast_plugins = []
+
+[logging]
+level = "INFO"
+# Includes incoming/outgoing text and command arguments; DEBUG does not enable this.
+message_content = false
+output = "journald"          # "journald", "rsyslog", or "both"
+rsyslog_host = ""            # Required for rsyslog/both; hostname or IP address
+rsyslog_protocol = "tcp"     # "tcp" or "udp"
+rsyslog_port = 514

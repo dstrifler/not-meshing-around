@@ -9,6 +9,7 @@ from dataclasses import replace
 
 from . import API_VERSION
 from .api import Registration, Routing
+from .observability import event as log_event
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ async def load_plugins(runtime, directory):
                 raise ValueError("plugin.enabled must be a boolean")
             if not metadata["enabled"]:
                 report[name] = {"status": "disabled"}
+                log_event(log, logging.INFO, 'plugin_disabled', plugin=name)
                 continue
             if metadata.get("id") != name:
                 raise ValueError("plugin.id must match filename")
@@ -54,8 +56,9 @@ async def load_plugins(runtime, directory):
                 config.get("routing", {}), registration.routing))
             await runtime.activate(name, registration)
             report[name] = {"status": "active", "version": metadata["version"]}
+            log_event(log, logging.INFO, 'plugin_loaded', plugin=name, version=metadata['version'])
         except (Exception, SystemExit) as error:
             sys.modules.pop(module_name, None)
             report[name] = {"status": "rejected", "reason": str(error)}
-            log.warning("Skipping plugin %s: %s", name, error)
+            log_event(log, logging.WARNING, 'plugin_rejected', plugin=name, error=error)
     return report

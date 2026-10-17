@@ -9,6 +9,10 @@ Each plugin's TOML file supports a `[routing]` table with `listen_mode`
 (`"origin"` or `"dm"`). Core applies these settings to commands, discovery, and
 delayed replies. See [command routing](docs/plugins.md#command-routing).
 
+Operational logs use readable text with journald output by default. Optional
+TCP/UDP syslog output and full message logging are configured in `bot.toml`;
+message bodies stay off by default, including at DEBUG. See [logging](docs/logging.md).
+
 ## Quick start
 
 Requires Python 3.11 or newer.
