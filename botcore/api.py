@@ -22,9 +22,51 @@ class Message:
 
 
 @dataclass(frozen=True)
+class Routing:
+    """Plugin command defaults; operator [routing] entries override these."""
+
+    listen_mode: str = "both"
+    channels: tuple[int, ...] = tuple(range(8))
+    reply_mode: str = "origin"
+
+    def __post_init__(self):
+        if self.listen_mode not in ("channels", "dm", "both"):
+            raise ValueError('routing.listen_mode must be "channels", "dm", or "both"')
+        if (not isinstance(self.channels, tuple) or
+                any(type(channel) is not int or not 0 <= channel <= 7 for channel in self.channels)):
+            raise ValueError("routing.channels must contain integer channel indexes from 0 to 7")
+        if len(set(self.channels)) != len(self.channels):
+            raise ValueError("routing.channels must not contain duplicates")
+        if self.reply_mode not in ("origin", "dm"):
+            raise ValueError('routing.reply_mode must be "origin" or "dm"')
+
+    @classmethod
+    def from_config(cls, config, default=None):
+        if not isinstance(config, dict):
+            raise ValueError("routing must be a TOML table")
+        if set(config) - {"listen_mode", "channels", "reply_mode"}:
+            raise ValueError("unknown routing setting")
+        default = default if default is not None else cls()
+        if not isinstance(default, cls):
+            raise TypeError("Registration.routing must be Routing")
+        channels = default.channels
+        if "channels" in config:
+            if not isinstance(config["channels"], list):
+                raise ValueError("routing.channels must be an array")
+            channels = tuple(config["channels"])
+        return cls(config.get("listen_mode", default.listen_mode), channels,
+                   config.get("reply_mode", default.reply_mode))
+
+    def accepts(self, message: Message) -> bool:
+        if message.direct:
+            return self.listen_mode in ("dm", "both")
+        return self.listen_mode in ("channels", "both") and message.channel in self.channels
+
+
+@dataclass(frozen=True)
 class Response:
     text: str | tuple[str, ...]  # A tuple supplies preplanned packet bodies.
-    destination: str = "reply"  # reply, private, or channel
+    destination: str = "reply"  # Core routing owns solicited replies; unsolicited sends use channel.
     channel: int | None = None
     interface: str | None = None
     normalize_mentions: bool = True
@@ -96,3 +138,4 @@ class Registration:
     jobs: tuple[Job, ...] = ()
     start: Hook | None = None
     stop: Hook | None = None
+    routing: Routing = Routing()

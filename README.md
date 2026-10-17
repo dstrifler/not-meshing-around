@@ -4,6 +4,11 @@ A plugin-driven Meshtastic bot, rebuilding the architecture of meshing-around.
 One controller starts the core services and adopts enabled plugins from
 `plugins.d/`. The default installation enables command discovery and ping.
 
+Each plugin's TOML file supports a `[routing]` table with `listen_mode`
+(`"channels"`, `"dm"`, or `"both"`), allowed channel indexes, and `reply_mode`
+(`"origin"` or `"dm"`). Core applies these settings to commands, discovery, and
+delayed replies. See [command routing](docs/plugins.md#command-routing).
+
 ## Quick start
 
 Requires Python 3.11 or newer.

@@ -26,10 +26,29 @@ The mention remains a label; it does not change the reply's recipient.
 
 ## Configuration
 
-`plugins.d/ping.toml` supplies these settings:
+`plugins.d/ping.toml` uses core's shared command routing:
+
+```toml
+[routing]
+listen_mode = "both"
+# channels = [0, 2]  # Omit to accept all channels; [] accepts none.
+reply_mode = "dm"
+```
+
+Set `listen_mode` to `channels`, `dm`, or `both`. DM acceptance is independent
+of the channel list. Ping replies privately by default; use `reply_mode = "origin"`
+to answer channel requests in their originating channel. DM requests always
+remain private. Immediate replies, sequence confirmations, help/errors, and
+delayed sequence messages all follow the same core routing. See
+[command routing](plugins.md#command-routing). Restart after configuration changes.
+
+Existing `[settings].reply_privately` values are supported as a compatibility
+fallback (`true` means `dm`, `false` means `origin`). An explicit
+`[routing].reply_mode` overrides that old value; use the new table for updates.
+
+The `[settings]` table supplies feature settings:
 
 - `reply`: configured ping response; default `🏓 Pong.`
-- `reply_privately`: default true, including replies to public-channel requests.
 - `show_noise_floor`: default false; include the bot's available local noise floor
   for confirmed direct RF requests only.
 - `interval_seconds`: default 20, permitted range 1–3600 seconds.

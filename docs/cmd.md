@@ -9,8 +9,13 @@ remain listed. Disabled, rejected, and command-free plugins add no entries.
 
 Core applies the request's normal policy: admin-only commands appear for admins,
 DM-only commands appear for DM requests, and blocked senders receive no reply.
-The reply retains the original audience: DMs receive a private response, while
-channel requests receive their response on that channel.
+Commands also follow their plugin's `listen_mode` and channel list. A command
+restricted to another channel or to DMs is absent from the current channel's
+list. Discovery uses the request's audience, even if cmd replies privately.
+By default the reply retains the original audience: DMs receive a private
+response, while channel requests receive their response on that channel.
+Operators can configure cmd's `[routing]` table with `listen_mode`, `channels`,
+and `reply_mode`; see [command routing](plugins.md#command-routing).
 
 Every packet starts with `CMD | Help`, after any core packet-number prefix. A
 single packet has no prefix, for example:

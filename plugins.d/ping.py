@@ -7,7 +7,7 @@ import math
 from time import monotonic
 from dataclasses import dataclass
 
-from botcore.api import Command, Event, Job, Message, Registration, Response
+from botcore.api import Command, Event, Job, Message, Registration, Response, Routing
 
 
 HELP = (
@@ -89,7 +89,7 @@ def register(settings):
     sessions = {}
 
     def response(text):
-        return Response(text, "private" if values["reply_privately"] else "reply")
+        return Response(text)
 
     def body(kind, message, label):
         text = {"ping": reply, "pong": "Ping.", "ack": "Acknowledged.",
@@ -188,4 +188,8 @@ def register(settings):
                           ("test", ("testing",)), ("cq", ("cqcq", "cqcqcq")), ("🔔", ())):
         commands.append(Command(name, handle, aliases=aliases, help=HELP))
         commands.append(Command(name + "?", handle, aliases=tuple(a + "?" for a in aliases), help=HELP))
-    return Registration(commands=tuple(commands), jobs=(Job("sequences", 1, tick),), stop=stop)
+    # Legacy settings remain a fallback for existing installations; the core's
+    # [routing] overrides the registered default and owns all reply delivery.
+    routing = Routing(reply_mode="dm" if values["reply_privately"] else "origin")
+    return Registration(commands=tuple(commands), jobs=(Job("sequences", 1, tick),),
+                        stop=stop, routing=routing)

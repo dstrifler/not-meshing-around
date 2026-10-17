@@ -9,7 +9,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field, replace
 
-from .api import Command, Context, Event, EventQueueFull, Job, Message, Registration, Response, Subscription
+from .api import Command, Context, Event, EventQueueFull, Job, Message, Registration, Response, Routing, Subscription
 from .mentions import MentionResolver, payload_units
 from .workers import positive_seconds
 
@@ -223,6 +223,7 @@ class Runtime:
             return ()
         return tuple(sorted({command.text for alias, (name, command) in self.commands.items()
                              if alias == command.text and self.plugins[name].status == "active"
+                             and self.plugins[name].registration.routing.accepts(message)
                              and self.policy.allows(message, command)}))
 
     def _mention_resolver(self, interface):
@@ -247,6 +248,8 @@ class Runtime:
     def validate(self, registration):
         if not isinstance(registration, Registration):
             raise TypeError("register must return Registration")
+        if not isinstance(registration.routing, Routing):
+            raise TypeError("Registration.routing must be Routing")
         for field_name in ("commands", "events", "jobs"):
             if not isinstance(getattr(registration, field_name), tuple):
                 raise TypeError(f"Registration.{field_name} must be a tuple")
@@ -369,7 +372,9 @@ class Runtime:
             if text.lower() != alias and not text.lower().startswith(alias + " "):
                 continue
             name, command = self.commands[alias]
-            if not self.policy.allows(message, command):
+            if (self.plugins[name].status != "active" or
+                    not self.plugins[name].registration.routing.accepts(message) or
+                    not self.policy.allows(message, command)):
                 return False
             try:
                 # Route by the original command spelling. Normalize message and
@@ -404,11 +409,26 @@ class Runtime:
             raise ValueError("invalid response destination")
         if message is None and response.destination != "channel":
             raise ValueError("unsolicited messages require an explicit channel")
+        if message is not None:
+            state = self.plugins.get(plugin)
+            routing = state.registration.routing if state else Routing()
+            if not routing.accepts(message):
+                raise PermissionError("plugin routing does not accept this request")
+            if message.sender in self.policy.blocked:
+                raise PermissionError("sender is blocked")
+            if ((message.direct and response.destination == "channel") or
+                    (response.channel is not None and response.channel != message.channel) or
+                    (response.interface is not None and response.interface != message.interface)):
+                raise PermissionError("replies must retain the originating conversation")
+            # Operator routing controls solicited delivery, including retained
+            # messages passed to services.reply by jobs and event handlers.
+            response = replace(response, destination=(
+                "private" if message.direct or routing.reply_mode == "dm" else "reply"))
         channel = response.channel if response.channel is not None else (message.channel if message else None)
         interface = response.interface or (message.interface if message else "primary")
         destination = message.sender if message and (response.destination == "private" or
                        (response.destination == "reply" and message.direct)) else None
-        # Scheduled broadcasts and any change of audience require explicit permission.
+        # Unsolicited broadcasts still require explicit global permission.
         broadcast = destination is None and (message is None or message.direct or channel != message.channel)
         if (broadcast or (message and interface != message.interface)) and plugin not in self.policy.broadcast_plugins:
             raise PermissionError("plugin is not permitted to broadcast or change interface")

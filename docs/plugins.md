@@ -58,6 +58,11 @@ version = "1.0.0"
 api_version = 1
 enabled = true
 
+[routing]
+listen_mode = "both"
+channels = [0, 2]
+reply_mode = "origin"
+
 [settings]
 greeting = "Hello"
 ```
@@ -89,6 +94,54 @@ Plugins implement and validate their own `[settings]`; the core validates the
 manifest and registration contract. `--check` runs initialization and shutdown
 hooks, so those hooks should avoid irreversible actions.
 
+## Command routing
+
+Each plugin's TOML file can include a core-managed `[routing]` table:
+
+```toml
+[routing]
+listen_mode = "both"    # "channels", "dm", or "both"
+channels = [0, 2]        # Zero-based Meshtastic channel indexes, 0-7
+reply_mode = "origin"   # "origin" or "dm"
+```
+
+The three listen modes are mutually exclusive. `channels` accepts only channel
+commands on the listed indexes; `dm` accepts only direct messages and ignores
+the channel list when matching requests; `both` accepts those channel commands
+and DMs. DMs are independent of the channel list. Omit `channels` to accept all
+indexes 0-7; `channels = []` accepts no channel commands. Values are validated
+even when the list is unused in DM-only mode. Unknown settings, invalid modes,
+duplicate indexes, non-integers (including booleans), and indexes outside 0-7
+reject the plugin before startup hooks or command activation. Restart the bot
+after editing configuration.
+
+`reply_mode = "origin"` replies in the requesting conversation: a channel request
+receives a response on that channel and a DM receives a DM. `reply_mode = "dm"`
+replies privately to the sender for both request types. Core selects the audience
+for every solicited response, including preplanned packets and delayed
+`services.reply` calls. A plugin's `Response.destination` cannot override this
+choice. Explicit attempts to turn a DM into a channel broadcast or change a
+reply's channel/interface are rejected, even with broadcast permission.
+
+Core filters dispatch, aliases, and `command_names(message)` using the same listen
+rules. The original request determines which commands `cmd` lists, even if its
+reply is delivered by DM. Global blocked/admin policy and each command's
+`direct_only` restriction still apply. Command names and aliases remain globally
+unique; disjoint channel lists do not allow duplicate registrations.
+
+Plugins may supply defaults via `Registration(routing=Routing(...))`, importing
+`Routing` from `botcore.api`. API channel indexes must be an immutable tuple, for
+example `Routing(channels=(0, 2), reply_mode="dm")`. Operator entries override
+individual registered defaults. The API default is `both`, all channels, and
+`origin`; ping registers `dm` replies by default. Existing manifests without
+`[routing]` continue to load. Ping's legacy `[settings].reply_privately` remains
+a fallback; an explicit `[routing].reply_mode` takes precedence.
+
+These settings govern command input and solicited replies. Event subscriptions,
+jobs, and explicit unsolicited `services.send` broadcasts retain their existing
+behavior and broadcast-policy requirements; a DM-only or command-free plugin
+can still receive events and run scheduled jobs.
+
 ## Contract
 
 Import public types from `botcore.api`. `register(settings)` is synchronous and
@@ -106,8 +159,9 @@ Handlers and lifecycle hooks are asynchronous; blocking I/O belongs in
   Messages also provide optional normalized SNR, RSSI, noise floor, hop count,
   MQTT status, and local node name for diagnostics.
   Return a `Response`, a list of responses, or `None`.
-- `Response(text)` replies to the incoming audience. `destination="private"`
-  replies to the sender. `destination="channel"` targets a channel.
+- `Response(text)` follows the plugin's configured `reply_mode` for solicited
+  responses. Core owns their audience and preserves their channel/interface.
+  For unsolicited messages, `destination="channel"` targets an explicit channel.
   Text normally uses core mention normalization and automatic byte splitting.
   `normalize_mentions=False` preserves literal command names or other text that
   must not be interpreted as mentions.
@@ -149,7 +203,8 @@ blocked-sender checks. `services.message_bytes` exposes the core's UTF-8 byte li
 of active primary command names allowed for that message by core policy. Aliases,
 command-free plugins, rejected/disabled plugins, and inactive registrations are
 omitted. Admin-only and DM-only commands are filtered for the requesting sender
-and audience; blocked senders get no names. The result reflects the live registry
+and audience, including each plugin's routing; blocked senders get no names.
+The result reflects the live registry
 at the time of the call and exposes no handler objects.
 
 Plugins that need repeated headers or whole entries in each packet can plan
@@ -173,10 +228,10 @@ Alternatively, retain the originating message and use `reply` for solicited
 delayed responses. See [ping.md](ping.md) for the diagnostics feature migration.
 
 Core policy applies blocked node IDs and command `admin_only`/`direct_only`
-flags. Unsolicited broadcasts, DM-to-channel responses, channel changes on
-public replies, and interface changes require the plugin ID in
-`policy.broadcast_plugins`. Direct replies to received public channel commands
-are allowed. Channel indices must be 0–7.
+flags. Unsolicited broadcasts require the plugin ID in `policy.broadcast_plugins`.
+Solicited replies cannot move to another channel/interface or broadcast a DM.
+Configured DM replies to received channel commands are allowed without broadcast
+permission. Channel indices must be 0–7.
 `policy.admins` and `policy.blocked` must be arrays of integer node IDs from
 0 to 0xffffffff. TOML hexadecimal integers such as `0x1234abcd` are accepted;
 quoted IDs, booleans, and out-of-range values reject startup. The broadcast

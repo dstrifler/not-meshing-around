@@ -5,8 +5,10 @@ import logging
 import re
 import sys
 import tomllib
+from dataclasses import replace
 
 from . import API_VERSION
+from .api import Registration, Routing
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +48,10 @@ async def load_plugins(runtime, directory):
             sys.modules[module_name] = module
             spec.loader.exec_module(module)
             registration = module.register(settings)
+            if not isinstance(registration, Registration):
+                raise TypeError("register must return Registration")
+            registration = replace(registration, routing=Routing.from_config(
+                config.get("routing", {}), registration.routing))
             await runtime.activate(name, registration)
             report[name] = {"status": "active", "version": metadata["version"]}
         except (Exception, SystemExit) as error:

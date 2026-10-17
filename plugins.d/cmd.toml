@@ -1,5 +1,10 @@
 [plugin]
 id = "cmd"
-version = "1.0.0"
+version = "1.1.0"
 api_version = 1
 enabled = true
+
+[routing]
+listen_mode = "both"
+# Omit channels to accept all indexes 0-7; [] disables channel commands.
+reply_mode = "origin"
