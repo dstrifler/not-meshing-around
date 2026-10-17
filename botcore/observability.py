@@ -221,7 +221,9 @@ class RemoteSyslog(logging.Handler):
         super().__init__()
         self.config, self.fallback = config, fallback
         self.records = queue.Queue(maxsize=capacity)
+        self.notices = queue.Queue(maxsize=16)
         self.closing = threading.Event()
+        self._notices_closing = threading.Event()
         self.deadline = float('inf')
         self.dropped = 0
         self.failures = 0
@@ -234,6 +236,9 @@ class RemoteSyslog(logging.Handler):
         self._unavailable = False
         self._hostname = re.sub(r'[^\w.-]', '_', socket.gethostname(), flags=re.ASCII)[:255] or '-'
         self.worker = threading.Thread(target=self._run, name='meshbot-syslog', daemon=True)
+        self.notice_worker = threading.Thread(target=self._run_notices,
+                                              name='meshbot-syslog-notices', daemon=True)
+        self.notice_worker.start()
         self.worker.start()
 
     def _notice(self, name, *, level=logging.WARNING, force=False, **fields):
@@ -252,7 +257,41 @@ class RemoteSyslog(logging.Handler):
         record.fields = fields | {'host': self.config.rsyslog_host, 'port': self.config.rsyslog_port,
                                   'protocol': self.config.rsyslog_protocol,
                                   'dropped': dropped, 'failures': failures}
-        self.fallback.handle(record)
+        try:
+            self.notices.put_nowait(record)
+        except queue.Full:
+            pass  # Local diagnostics are best effort too; never block a producer.
+
+    def _run_notices(self):
+        while time.monotonic() < self.deadline:
+            try:
+                record = self.notices.get(timeout=.05)
+            except queue.Empty:
+                if self._notices_closing.is_set():
+                    return
+                continue
+            try:
+                stream = getattr(self.fallback, 'stream', None)
+                try:
+                    descriptor = stream.fileno()
+                except (AttributeError, OSError, ValueError):
+                    # In-memory/custom sinks, without acquiring a Handler lock.
+                    self.fallback.emit(record)
+                else:
+                    # Bypass buffered stream/Handler locks: a blocked pipe must
+                    # not trap logging.shutdown() flushing the local handler.
+                    rendered = self.fallback.format(record) + self.fallback.terminator
+                    data = rendered.encode(getattr(stream, 'encoding', None) or 'utf-8',
+                                           errors='backslashreplace')
+                    while data:
+                        written = os.write(descriptor, data)
+                        if not written:
+                            break
+                        data = data[written:]
+            except Exception:
+                pass  # Reporting a broken local sink must not recurse into logging.
+            finally:
+                self.notices.task_done()
 
     def _drop(self, *, failure=False):
         with self._stats_lock:
@@ -338,11 +377,14 @@ class RemoteSyslog(logging.Handler):
         self._closed_once = True
         self.deadline = time.monotonic() + 1
         self.closing.set()
-        self.worker.join(timeout=1)
+        # Reserve a small part of the shared deadline for the final local notice.
+        self.worker.join(timeout=max(0, self.deadline - time.monotonic() - .1))
         if self.worker.is_alive() or not self.records.empty():
             self._notice('syslog_shutdown_incomplete', pending=self.records.qsize(), force=True)
         elif self.dropped:
             self._notice('syslog_summary', force=True)
+        self._notices_closing.set()
+        self.notice_worker.join(timeout=max(0, self.deadline - time.monotonic()))
         super().close()
 
 

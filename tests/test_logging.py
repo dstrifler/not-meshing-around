@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from botcore import controller
-from botcore.api import Command, Message, Registration, Response
+from botcore.api import Command, Event, EventQueueFull, Message, Registration, Response
 from botcore.observability import (LoggingConfig, LoggingSession, RateLimit, RemoteSyslog,
                                    TextFormatter, event)
 from botcore.runtime import PluginServices, Runtime
@@ -220,7 +220,8 @@ class RemoteLoggingTests(unittest.TestCase):
             remote = next(h for h in session.handlers if isinstance(h, RemoteSyslog))
             try:
                 event(LOG, logging.INFO, 'first')
-                wait_until(lambda: remote.failures == 1 and remote.records.unfinished_tasks == 0)
+                wait_until(lambda: remote.failures == 1 and remote.records.unfinished_tasks == 0
+                           and remote.notices.unfinished_tasks == 0)
                 for _ in range(20):
                     event(LOG, logging.INFO, 'during_outage')
                 wait_until(lambda: remote.records.unfinished_tasks == 0)
@@ -228,7 +229,8 @@ class RemoteLoggingTests(unittest.TestCase):
                 self.assertNotIn('NETWORK_SECRET', stream.getvalue())
                 remote._retry_at = 0
                 event(LOG, logging.INFO, 'after_recovery')
-                wait_until(lambda: connection.sendall.called and remote.records.unfinished_tasks == 0)
+                wait_until(lambda: connection.sendall.called and remote.records.unfinished_tasks == 0
+                           and remote.notices.unfinished_tasks == 0)
                 self.assertIn('syslog_recovered', stream.getvalue())
             finally:
                 session.close()
@@ -261,6 +263,7 @@ class RemoteLoggingTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, .5)
                 self.assertLessEqual(remote.records.qsize(), 2)
                 self.assertGreater(remote.dropped, 0)
+                wait_until(lambda: remote.notices.unfinished_tasks == 0)
                 self.assertEqual(stream.getvalue().count('syslog_queue_full'), 1)
                 started = time.monotonic()
                 remote.close()
@@ -272,6 +275,115 @@ class RemoteLoggingTests(unittest.TestCase):
                 remote.close()
             self.assertFalse(remote.worker.is_alive())
             connection.close.assert_called_once()
+
+    def test_stalled_local_notice_cannot_block_remote_delivery_or_shutdown(self):
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+        connection = Mock()
+
+        class StalledSink(logging.Handler):
+            def emit(self, record):
+                entered.set()
+                release.wait(5)
+
+        with patch('botcore.observability.socket.create_connection', side_effect=[
+                ConnectionRefusedError('offline'), connection]):
+            remote = RemoteSyslog(LoggingConfig(output='rsyslog', rsyslog_host='loghost'), StalledSink())
+            remote.setFormatter(TextFormatter())
+            closer = threading.Thread(target=lambda: (remote.close(), closed.set()), daemon=True)
+            record = logging.LogRecord('botcore.test', logging.INFO, '', 0, 'queued', (), None)
+            try:
+                remote.handle(record)
+                self.assertTrue(entered.wait(2))
+                remote._retry_at = 0
+                remote.handle(record)
+                wait_until(lambda: connection.sendall.called)
+                closer.start()
+                self.assertTrue(closed.wait(1.5), 'local stderr stalled logging shutdown')
+                self.assertTrue(remote.notice_worker.is_alive())
+            finally:
+                release.set()
+                if closer.ident is not None:
+                    closer.join(2)
+                remote.close()
+                remote.worker.join(2)
+                remote.notice_worker.join(2)
+            self.assertFalse(remote.notice_worker.is_alive())
+
+    def test_queue_overflow_producer_and_notice_queue_stay_bounded_with_stalled_stderr(self):
+        network_entered, notice_entered, release = (threading.Event() for _ in range(3))
+        produced = threading.Event()
+
+        def connect(*args, **kwargs):
+            network_entered.set()
+            release.wait(5)
+            return Mock()
+
+        class StalledSink(logging.Handler):
+            def emit(self, record):
+                notice_entered.set()
+                release.wait(5)
+
+        with patch('botcore.observability.socket.create_connection', side_effect=connect):
+            remote = RemoteSyslog(LoggingConfig(output='rsyslog', rsyslog_host='loghost'),
+                                  StalledSink(), capacity=2)
+            remote.setFormatter(TextFormatter())
+            record = logging.LogRecord('botcore.test', logging.INFO, '', 0, 'queued', (), None)
+
+            def produce():
+                for _ in range(100):
+                    remote.handle(record)
+                produced.set()
+
+            producer = threading.Thread(target=produce, daemon=True)
+            try:
+                remote.handle(record)
+                self.assertTrue(network_entered.wait(2))
+                producer.start()
+                self.assertTrue(produced.wait(1), 'queue overflow blocked the producer on stderr')
+                self.assertTrue(notice_entered.wait(2))
+                for _ in range(100):
+                    remote._notice('syslog_recovered', force=True)
+                self.assertEqual(remote.notices.qsize(), 16)
+                self.assertEqual(remote.records.qsize(), 2)
+                self.assertGreater(remote.dropped, 0)
+            finally:
+                release.set()
+                if producer.ident is not None:
+                    producer.join(2)
+                remote.close()
+                remote.worker.join(2)
+                remote.notice_worker.join(2)
+
+    def test_blocked_pipe_does_not_trap_python_logging_shutdown_at_process_exit(self):
+        # Fill a real local output pipe without reading it. The diagnostic writer
+        # must not hold a stream/Handler lock that atexit's logging.shutdown needs.
+        script = '''
+import logging, os, time
+from botcore.observability import LoggingConfig, RemoteSyslog, TextFormatter
+reader, writer = os.pipe()
+os.set_blocking(writer, False)
+try:
+    while True:
+        os.write(writer, b'x' * 4096)
+except BlockingIOError:
+    pass
+os.set_blocking(writer, True)
+stream = os.fdopen(writer, 'w')
+fallback = logging.StreamHandler(stream)
+fallback.setFormatter(TextFormatter())
+remote = RemoteSyslog(LoggingConfig(output='rsyslog', rsyslog_host='loghost'), fallback)
+remote._notice('test_blocked_pipe', force=True)
+deadline = time.monotonic() + 1
+while remote.notices.qsize() and time.monotonic() < deadline:
+    time.sleep(.002)
+assert remote.notices.unfinished_tasks == 1
+remote.close()
+print('closed', flush=True)
+'''
+        result = subprocess.run([sys.executable, '-c', script], capture_output=True,
+                                text=True, cwd=ROOT, timeout=4)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'closed')
 
 
 class RequestLoggingTests(unittest.IsolatedAsyncioTestCase):
@@ -362,6 +474,74 @@ class RequestLoggingTests(unittest.IsolatedAsyncioTestCase):
         with patch('botcore.transport.monotonic', return_value=time.monotonic() + 121):
             radio._expire_submissions(time.monotonic() + 121)
         self.assertEqual(len(radio._submissions), 0)
+
+    async def test_distinct_nak_reasons_keep_correlation_and_independent_suppression_counts(self):
+        radio = MeshtasticTransport({'type': 'tcp', 'hostname': 'radio'})
+        radio.runtime = self.runtime
+
+        async def nak(packet_id, reason):
+            radio.record_submission(packet_id, {'trace': f'request{packet_id}', 'plugin': 'ping'})
+            await radio._handle({'from': 1, 'decoded': {'portnum': 'ROUTING_APP',
+                'requestId': packet_id, 'routing': {'errorReason': reason}}})
+
+        with patch('botcore.observability.time.monotonic', return_value=time.monotonic()) as now:
+            await nak(1, 'NO_RESPONSE')
+            await nak(2, 'PKI_SEND_FAIL_PUBLIC_KEY')
+            await nak(3, 'NO_RESPONSE')
+            await nak(4, 'PKI_SEND_FAIL_PUBLIC_KEY')
+            await nak(5, 'PKI_SEND_FAIL_PUBLIC_KEY')
+            lines = [line for line in self.stream.getvalue().splitlines() if ' radio_nak ' in line]
+            self.assertEqual(len(lines), 2)
+            self.assertIn('trace=request1', lines[0])
+            self.assertIn('reason=NO_RESPONSE', lines[0])
+            self.assertIn('trace=request2', lines[1])
+            self.assertIn('guidance=destination_public_key_missing', lines[1])
+            now.return_value += 31
+            await nak(6, 'NO_RESPONSE')
+            await nak(7, 'PKI_SEND_FAIL_PUBLIC_KEY')
+        lines = [line for line in self.stream.getvalue().splitlines() if ' radio_nak ' in line]
+        self.assertEqual(len(lines), 4)
+        self.assertIn('suppressed=1', lines[2])
+        self.assertIn('trace=request6', lines[2])
+        self.assertIn('suppressed=2', lines[3])
+        self.assertIn('trace=request7', lines[3])
+        self.assertEqual(len(radio._submissions), 0)
+
+    def test_nak_limiter_memory_is_bounded_even_for_unknown_firmware_reasons(self):
+        radio = MeshtasticTransport({'type': 'tcp', 'hostname': 'radio'})
+        for index in range(200):
+            radio._log_routing({'decoded': {'routing': {'errorReason': f'ERROR_{index}'}}})
+        self.assertEqual(len(radio._routing_warnings), 128)
+        self.assertNotIn('ERROR_0', radio._routing_warnings)
+        self.assertIn('ERROR_199', radio._routing_warnings)
+
+    async def test_radio_event_overflow_uses_core_warning_without_per_packet_errors(self):
+        radio = MeshtasticTransport({'type': 'tcp', 'hostname': 'radio'})
+        radio.runtime = self.runtime
+        for _ in range(self.runtime.events.maxsize):
+            self.runtime.enqueue_event(Event('existing'))
+        packet = {'from': 1, 'decoded': {'portnum': 'TELEMETRY_APP'}}
+        with patch('botcore.observability.time.monotonic', return_value=time.monotonic()) as now:
+            for _ in range(20):
+                await radio._handle(packet)
+            value = self.stream.getvalue()
+            self.assertEqual(value.count(' event_queue_full '), 1)
+            self.assertNotIn('radio_packet_failed', value)
+            self.assertEqual(self.runtime.events.qsize(), self.runtime.events.maxsize)
+            now.return_value += 31
+            await radio._handle(packet)
+            self.assertIn('event_queue_full suppressed=19', self.stream.getvalue())
+        # Plugin callers still receive explicit backpressure.
+        with self.assertRaises(EventQueueFull):
+            self.runtime.enqueue_event(Event('plugin.event'))
+        self.runtime.events.get_nowait()
+        self.runtime.events.task_done()
+        await radio._handle(packet)
+        self.assertEqual(self.runtime.events.qsize(), self.runtime.events.maxsize)
+        # Unexpected ingress failures remain visible.
+        await radio._handle({'decoded': None})
+        self.assertEqual(self.stream.getvalue().count(' radio_packet_failed '), 1)
+        self.assertIn('error_type=AttributeError', self.stream.getvalue())
 
     async def test_invalid_logging_is_rejected_before_plugin_or_database_initialization(self):
         with tempfile.TemporaryDirectory() as directory:

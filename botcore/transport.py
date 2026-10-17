@@ -10,7 +10,7 @@ import threading
 from collections import OrderedDict
 from time import monotonic
 
-from .api import Event, Message
+from .api import Event, EventQueueFull, Message
 from .mentions import NodeIdentity, valid_number
 from .observability import RateLimit, event as log_event, node_id
 from .workers import blocking_call, positive_seconds
@@ -129,7 +129,7 @@ class MeshtasticTransport:
         self._stop_worker = threading.Event()
         self._closed = False
         self._queue_warning = RateLimit()
-        self._routing_warning = RateLimit()
+        self._routing_warnings = OrderedDict()
         self._submissions = OrderedDict()
 
     def health(self):
@@ -323,7 +323,10 @@ class MeshtasticTransport:
                     log_event(log, logging.DEBUG, 'radio_packet_received',
                               port=decoded.get('portnum'), rx_packet=packet.get('id'),
                               sender=node_id(packet.get('from')))
-                self.runtime.enqueue_event(Event("radio.packet", packet))
+                try:
+                    self.runtime.enqueue_event(Event("radio.packet", packet))
+                except EventQueueFull:
+                    pass  # Runtime already emitted the rate-limited overflow warning.
         except Exception as error:
             log_event(log, logging.ERROR, 'radio_packet_failed', error=error)
 
@@ -357,7 +360,13 @@ class MeshtasticTransport:
         if reason == 'NONE':
             log_event(log, logging.INFO, 'radio_ack', **fields)
         else:
-            suppressed = self._routing_warning.allow()
+            limiter = self._routing_warnings.get(reason)
+            if limiter is None:
+                limiter = self._routing_warnings[reason] = RateLimit()
+            self._routing_warnings.move_to_end(reason)
+            while len(self._routing_warnings) > 128:
+                self._routing_warnings.popitem(last=False)
+            suppressed = limiter.allow()
             if suppressed is not None:
                 hints = {'PKI_SEND_FAIL_PUBLIC_KEY': 'destination_public_key_missing',
                          'PKI_UNKNOWN_PUBKEY': 'sender_public_key_missing',
