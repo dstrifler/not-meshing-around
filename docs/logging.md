@@ -60,7 +60,11 @@ Remote failure, overflow, recovery, and drop summaries appear locally on stderr,
 including with `output = "rsyslog"`. Repeated failure/overflow notices are limited
 to one per 30 seconds. Recovery and final summaries include aggregate counters.
 These logger-health diagnostics remain visible independently of the selected
-application destination/level. Invalid startup configuration is also reported
+application destination/level. A separate daemon worker writes these notices
+through a bounded 16-record queue, so stalled local output cannot block remote
+delivery, application producers, or the one-second logging shutdown deadline.
+Notices are best effort and can be lost if that queue fills or shutdown expires.
+Invalid startup configuration is also reported
 locally if the requested destination cannot be initialized.
 
 ## Levels and records
@@ -97,7 +101,12 @@ Incoming encryption is `pki` or `non_pki` only when an explicit flag is availabl
 otherwise `unknown`. `non_pki` does not distinguish channel encryption from
 cleartext. Outgoing logs say `firmware_decides`: SDK submission precedes on-air
 encryption. DM status alone never establishes encryption. Repeated NAK/queue
-warnings report suppressed counts instead of flooding the journal.
+warnings report suppressed counts instead of flooding the journal. NAKs are
+limited separately by failure reason, so a missing-public-key failure remains
+visible immediately after a different failure. At most 128 recent reason
+limiters are retained; evicted reasons start a new suppression window. A full
+event queue drops the incoming radio event with the core's limited warning;
+it does not also generate a generic packet-processing error for each drop.
 
 ## Contents, secrets, and plugin API
 
