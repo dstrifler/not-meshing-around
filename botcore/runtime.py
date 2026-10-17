@@ -7,10 +7,12 @@ import logging
 import math
 import re
 import sqlite3
+from time import monotonic
 from dataclasses import dataclass, field, replace
 
 from .api import Command, Context, Event, EventQueueFull, Job, Message, Registration, Response, Routing, Subscription
 from .mentions import MentionResolver, payload_units
+from .observability import PluginLogger, RateLimit, event as log_event, log_context, message_fields, node_id
 from .workers import positive_seconds
 
 log = logging.getLogger(__name__)
@@ -154,6 +156,10 @@ class PluginServices:
         self._runtime, self._plugin = runtime, plugin
 
     @property
+    def logger(self):
+        return PluginLogger(self._plugin)
+
+    @property
     def message_bytes(self):
         return self._runtime.byte_limit
 
@@ -173,15 +179,23 @@ class PluginServices:
         await self._runtime.deliver(self._plugin, response, message)
 
     def get(self, key, default=None):
-        row = self._runtime.db.execute(
-            "SELECT value FROM state WHERE plugin=? AND key=?",
-            (self._plugin, key)).fetchone()
+        try:
+            row = self._runtime.db.execute(
+                "SELECT value FROM state WHERE plugin=? AND key=?",
+                (self._plugin, key)).fetchone()
+        except sqlite3.Error as error:
+            log_event(log, logging.ERROR, 'storage_failed', plugin=self._plugin, operation='read', error=error)
+            raise
         return json.loads(row[0]) if row else default
 
     def set(self, key, value):
-        with self._runtime.db:
-            self._runtime.db.execute("INSERT OR REPLACE INTO state VALUES (?, ?, ?)",
-                                     (self._plugin, key, json.dumps(value)))
+        try:
+            with self._runtime.db:
+                self._runtime.db.execute("INSERT OR REPLACE INTO state VALUES (?, ?, ?)",
+                                         (self._plugin, key, json.dumps(value)))
+        except sqlite3.Error as error:
+            log_event(log, logging.ERROR, 'storage_failed', plugin=self._plugin, operation='write', error=error)
+            raise
 
     async def emit(self, event):
         if self._runtime.plugins[self._plugin].status != "active":
@@ -211,6 +225,7 @@ class Runtime:
                         "(plugin TEXT, key TEXT, value TEXT, PRIMARY KEY(plugin,key))")
         self.plugins, self.commands = {}, {}
         self.events = asyncio.Queue(maxsize=256)
+        self._event_warning = RateLimit()
         self.delivery_lock = asyncio.Lock()
 
     def health(self):
@@ -243,6 +258,9 @@ class Runtime:
         try:
             self.events.put_nowait(event)
         except asyncio.QueueFull as error:
+            suppressed = self._event_warning.allow()
+            if suppressed is not None:
+                log_event(log, logging.WARNING, 'event_queue_full', suppressed=suppressed)
             raise EventQueueFull("event queue is full") from error
 
     def validate(self, registration):
@@ -300,6 +318,11 @@ class Runtime:
                     self.commands[alias] = (name, command)
             if self._running:
                 self._start_jobs(name, state)
+            log_event(log, logging.INFO, 'plugin_activated', plugin=name,
+                      commands=len(registration.commands), jobs=len(registration.jobs),
+                      subscriptions=len(registration.events), listen_mode=registration.routing.listen_mode,
+                      channels=','.join(map(str, registration.routing.channels)),
+                      reply_mode=registration.routing.reply_mode)
         except BaseException as original:
             state.status = "failed"
             if isinstance(original, asyncio.CancelledError) and isinstance(original.__cause__, Exception):
@@ -352,7 +375,7 @@ class Runtime:
         state = self.plugins[name]
         state.errors += 1
         state.last_error = str(error)
-        log.exception("Plugin %s handler failed", name)
+        log_event(log, logging.ERROR, 'plugin_failed', plugin=name, errors=state.errors, error=error)
 
     async def _invoke_handler(self, name, handler, *args):
         """Contain plugin cancellation while preserving cancellation of core work."""
@@ -364,7 +387,17 @@ class Runtime:
             raise
 
     async def dispatch(self, message):
+        with log_context(**message_fields(message)):
+            encryption = ('pki' if message.pki_encrypted else 'non_pki') \
+                if message.pki_encrypted is not None else 'unknown'
+            log_event(log, logging.INFO, 'message_received', bytes=len(message.text.encode('utf-8')),
+                      encryption=encryption, content=(message.original_text
+                      if message.original_text is not None else message.text))
+            return await self._dispatch(message)
+
+    async def _dispatch(self, message):
         if self._closing:
+            log_event(log, logging.DEBUG, 'message_ignored', reason='shutting_down')
             return False
         text = message.text.strip()
         # Longest command wins; matching is case insensitive and boundary aware.
@@ -375,7 +408,14 @@ class Runtime:
             if (self.plugins[name].status != "active" or
                     not self.plugins[name].registration.routing.accepts(message) or
                     not self.policy.allows(message, command)):
+                reason = ('sender_blocked' if message.sender in self.policy.blocked else
+                          'admin_required' if command.admin_only and message.sender not in self.policy.admins else
+                          'dm_required' if command.direct_only and not message.direct else
+                          'plugin_inactive' if self.plugins[name].status != 'active' else 'plugin_routing')
+                log_event(log, logging.DEBUG, 'command_rejected', plugin=name, command=command.text, reason=reason)
                 return False
+            started = monotonic()
+            log_event(log, logging.INFO, 'command_started', plugin=name, command=command.text)
             try:
                 # Route by the original command spelling. Normalize message and
                 # arguments from one identity snapshot so aliases containing @
@@ -392,10 +432,21 @@ class Runtime:
                     await self.deliver(name, response, message)
             except Exception as error:
                 self.failed(name, error)
+                log_event(log, logging.DEBUG, 'command_finished', plugin=name, command=command.text,
+                          outcome='failed', duration_ms=round((monotonic() - started) * 1000, 2))
+            else:
+                log_event(log, logging.INFO, 'command_finished', plugin=name, command=command.text,
+                          outcome='completed', duration_ms=round((monotonic() - started) * 1000, 2))
             return True
+        log_event(log, logging.DEBUG, 'message_ignored', reason='unknown_command')
         return False
 
     async def deliver(self, plugin, response, message=None):
+        fields = message_fields(message) if message is not None else {'audience': 'unsolicited'}
+        with log_context(**fields, plugin=plugin):
+            return await self._deliver(plugin, response, message)
+
+    async def _deliver(self, plugin, response, message=None):
         if self._closing:
             raise RuntimeError("runtime is stopping")
         if not isinstance(response, Response) or not isinstance(response.text, (str, tuple)):
@@ -453,12 +504,26 @@ class Runtime:
                     raise ValueError("preplanned packet exceeds core.message_bytes after formatting")
             else:
                 parts = chunks(bodies[0], self.byte_limit)
-            for part in parts:
+            log_event(log, logging.DEBUG, 'response_planned', packets=len(parts),
+                      destination=node_id(destination) if destination is not None else 'broadcast',
+                      channel=channel, interface=interface)
+            for index, part in enumerate(parts, 1):
                 try:
                     async with asyncio.timeout(self.send_timeout):
-                        await self.transport.send(part, destination, channel, interface)
+                        packet_id = await self.transport.send(part, destination, channel, interface)
                 except TimeoutError as error:
+                    log_event(log, logging.ERROR, 'response_timeout', packet=index, error=error)
                     raise TimeoutError("transport send timed out") from error
+                except Exception as error:
+                    log_event(log, logging.ERROR, 'response_failed', packet=index, error=error)
+                    raise
+                record_submission = getattr(self.transport, 'record_submission', None)
+                if record_submission and type(packet_id) is int:
+                    record_submission(packet_id, {'trace': message.trace_id if message else None, 'plugin': plugin})
+                log_event(log, logging.INFO, 'response_submitted', tx_packet=packet_id,
+                          packet=index, packets=len(parts), bytes=len(part.encode('utf-8')),
+                          destination=node_id(destination) if destination is not None else 'broadcast',
+                          channel=channel, interface=interface, encryption='firmware_decides', content=part)
                 await asyncio.sleep(self.send_delay)
         finally:
             self.delivery_lock.release()
@@ -471,18 +536,22 @@ class Runtime:
                     continue
                 for subscription in state.registration.events:
                     if subscription.event == event.name:
-                        try:
-                            await self._invoke_handler(name, subscription.handler, event, PluginServices(self, name))
-                        except Exception as error:
-                            self.failed(name, error)
+                        with log_context(plugin=name, event=event.name):
+                            try:
+                                log_event(log, logging.DEBUG, 'event_dispatch')
+                                await self._invoke_handler(name, subscription.handler, event, PluginServices(self, name))
+                            except Exception as error:
+                                self.failed(name, error)
 
     async def _job(self, name, job, services):
         while True:
             await asyncio.sleep(job.interval)
-            try:
-                await self._invoke_handler(name, job.handler, services)
-            except Exception as error:
-                self.failed(name, error)
+            with log_context(plugin=name, job=job.name):
+                try:
+                    log_event(log, logging.DEBUG, 'job_started')
+                    await self._invoke_handler(name, job.handler, services)
+                except Exception as error:
+                    self.failed(name, error)
 
     async def close(self, *, timeout=10):
         if self._closed:
@@ -520,6 +589,7 @@ class Runtime:
                 state.status = "failed"
             else:
                 state.status = "stopped"
+                log_event(log, logging.INFO, 'plugin_stopped', plugin=name)
 
         try:
             try:

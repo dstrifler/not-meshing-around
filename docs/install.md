@@ -103,6 +103,12 @@ directory. The new checkout's default configuration is also saved as
 tests: inspect the journal for radio readiness or startup errors. The service
 restarts after failures, with a rate limit to avoid an endless rapid restart loop.
 
+Logging defaults to readable text in the journal, with message contents disabled.
+The `[logging]` table in `bot.toml` can select journald, TCP/UDP syslog, or both;
+see [logging configuration](logging.md). Updates preserve existing configuration,
+so add the table manually to customize it. The installer captures stdout/stderr
+in the journal but does not change host journal retention or configure rsyslog.
+
 ## Reinstalling or updating
 
 Update your original checkout, then rerun its installer and choose the existing

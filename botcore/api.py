@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Protocol
+from uuid import uuid4
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,9 @@ class Message:
     noise_floor: float | None = None
     transport: str | None = None
     original_text: str | None = None  # Received text before core mention normalization.
+    packet_id: int | None = None
+    pki_encrypted: bool | None = None  # Reported by firmware, not inferred from DM status.
+    trace_id: str = field(default_factory=lambda: uuid4().hex[:12])
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,8 @@ class EventQueueFull(RuntimeError):
 
 
 class Services(Protocol):
+    @property
+    def logger(self) -> Any: ...  # PluginLogger from botcore.observability.
     @property
     def message_bytes(self) -> int: ...
     def command_names(self, message: Message) -> tuple[str, ...]: ...

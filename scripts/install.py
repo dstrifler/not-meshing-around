@@ -275,6 +275,7 @@ def render_unit(options, data):
             f'ExecStart=:/usr/bin/env -- {unit_quote(prefix / "venv/bin/python")} {unit_quote(prefix / "mesh_bot.py")} '
             f'--config {unit_quote(prefix / "bot.toml")}\n'
             'Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1\n'
+            'StandardOutput=journal\nStandardError=journal\nSyslogIdentifier=meshbot\nSyslogLevelPrefix=yes\n'
             'Restart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=90\n'
             'UMask=0027\nNoNewPrivileges=true\nProtectSystem=strict\n'
             'ProtectKernelTunables=true\nProtectControlGroups=true\nRestrictSUIDSGID=true\n'

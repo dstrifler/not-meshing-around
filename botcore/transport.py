@@ -7,9 +7,12 @@ import re
 import socket
 import sys
 import threading
+from collections import OrderedDict
+from time import monotonic
 
 from .api import Event, Message
 from .mentions import NodeIdentity, valid_number
+from .observability import RateLimit, event as log_event, node_id
 from .workers import blocking_call, positive_seconds
 
 log = logging.getLogger(__name__)
@@ -62,7 +65,10 @@ def radio_message(packet, local_node, node_name=None, noise_floor=None):
         direct=packet.get("to") == local_node, snr=number(packet.get("rxSnr")),
         rssi=number(packet.get("rxRssi")), hops=hops,
         via_mqtt=mqtt, transport=transport,
-        node_name=node_name if isinstance(node_name, str) else None, noise_floor=number(noise_floor))
+        node_name=node_name if isinstance(node_name, str) else None, noise_floor=number(noise_floor),
+        packet_id=packet.get('id') if type(packet.get('id')) is int else None,
+        pki_encrypted=packet.get('pkiEncrypted', packet.get('pki_encrypted'))
+        if type(packet.get('pkiEncrypted', packet.get('pki_encrypted'))) is bool else None)
 
 
 class ConsoleTransport:
@@ -122,6 +128,9 @@ class MeshtasticTransport:
         self._stopping = False
         self._stop_worker = threading.Event()
         self._closed = False
+        self._queue_warning = RateLimit()
+        self._routing_warning = RateLimit()
+        self._submissions = OrderedDict()
 
     def health(self):
         return {"status": self.status, "last_error": self.last_error}
@@ -154,6 +163,9 @@ class MeshtasticTransport:
         self.runtime, self.loop = runtime, asyncio.get_running_loop()
         self.status = "starting"
         kind = self.settings.get("type")
+        log_event(log, logging.INFO, 'radio_connecting', transport=kind,
+                  hostname=self.settings.get('hostname'), port=self.settings.get('port', 4403),
+                  device=self.settings.get('device'))
         if kind == "tcp":
             from meshtastic.tcp_interface import TCPInterface
             factory = TCPInterface
@@ -178,6 +190,8 @@ class MeshtasticTransport:
                 raise ConnectionError(self.last_error)
             self.status = "ready"
             self.accepting = True
+            log_event(log, logging.INFO, 'radio_ready', transport=kind,
+                      local_node=node_id(self.interface.myInfo.my_node_num))
         except Exception as error:
             self._fail("radio startup timed out" if isinstance(error, TimeoutError)
                        else f"radio startup failed: {error}")
@@ -263,7 +277,10 @@ class MeshtasticTransport:
         self.accepting = False
         self.status, self.last_error = "failed", reason
         self._failure.set()
-        log.error("Radio transport failed: %s", reason)
+        # Preserve detailed health internally, but SDK exception text may
+        # contain packet payloads; logs use a stable reason category.
+        category = reason.split(':', 1)[0]
+        log_event(log, logging.ERROR, 'radio_failed', reason=category)
 
     def receive(self, packet, interface):
         if not self.accepting or interface is not self.interface:
@@ -275,7 +292,9 @@ class MeshtasticTransport:
         if not self.accepting:
             return
         if len(self.pending) >= 256:
-            log.warning("Dropping radio packet: receive queue full")
+            suppressed = self._queue_warning.allow()
+            if suppressed is not None:
+                log_event(log, logging.WARNING, 'radio_queue_full', suppressed=suppressed)
             return
         task = asyncio.create_task(self._handle(packet))
         self.pending.add(task)
@@ -289,15 +308,62 @@ class MeshtasticTransport:
                 local_node = self.interface.myInfo.my_node_num
                 if (packet.get("to") not in (local_node, 0xffffffff)
                         or packet.get("from") == local_node):
+                    log_event(log, logging.DEBUG, 'radio_text_ignored',
+                              rx_packet=packet.get('id'), sender=node_id(packet.get('from')),
+                              reason='local_echo' if packet.get('from') == local_node else 'other_recipient')
                     return
                 local_info = nodes.get(f"!{local_node:08x}", {})
                 name = local_info.get("user", {}).get("shortName")
                 noise = local_info.get("localStats", {}).get("noiseFloor")
                 await self.runtime.dispatch(radio_message(packet, local_node, name, noise))
             else:
+                if decoded.get('portnum') == 'ROUTING_APP':
+                    self._log_routing(packet)
+                else:
+                    log_event(log, logging.DEBUG, 'radio_packet_received',
+                              port=decoded.get('portnum'), rx_packet=packet.get('id'),
+                              sender=node_id(packet.get('from')))
                 self.runtime.enqueue_event(Event("radio.packet", packet))
-        except Exception:
-            log.exception("Unable to process radio packet")
+        except Exception as error:
+            log_event(log, logging.ERROR, 'radio_packet_failed', error=error)
+
+    def record_submission(self, packet_id, fields):
+        now = monotonic()
+        self._expire_submissions(now)
+        self._submissions[packet_id] = (now, fields)
+        self._submissions.move_to_end(packet_id)
+        while len(self._submissions) > 1024:
+            self._submissions.popitem(last=False)
+
+    def _expire_submissions(self, now):
+        while self._submissions and next(iter(self._submissions.values()))[0] < now - 120:
+            self._submissions.popitem(last=False)
+
+    def _log_routing(self, packet):
+        decoded = packet.get('decoded', {})
+        routing = decoded.get('routing', {})
+        if not isinstance(routing, dict):
+            return
+        reason = routing.get('errorReason', routing.get('error_reason', 'NONE'))
+        if not isinstance(reason, str) or not re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', reason):
+            reason = 'UNKNOWN'
+        request_id = decoded.get('requestId', decoded.get('request_id'))
+        self._expire_submissions(monotonic())
+        submission = self._submissions.pop(request_id, None) if type(request_id) is int else None
+        fields = dict(submission[1]) if submission else {}
+        fields.update(ack_for=request_id if type(request_id) is int else None,
+                      sender=node_id(packet.get('from')), reason=reason,
+                      channel=packet.get('channel', 0))
+        if reason == 'NONE':
+            log_event(log, logging.INFO, 'radio_ack', **fields)
+        else:
+            suppressed = self._routing_warning.allow()
+            if suppressed is not None:
+                hints = {'PKI_SEND_FAIL_PUBLIC_KEY': 'destination_public_key_missing',
+                         'PKI_UNKNOWN_PUBKEY': 'sender_public_key_missing',
+                         'PKI_FAILED': 'check_key_material_and_firmware'}
+                log_event(log, logging.WARNING, 'radio_nak', suppressed=suppressed,
+                          guidance=hints.get(reason, 'inspect_radio_configuration'), **fields)
 
     async def send(self, text, destination, channel, interface):
         if interface != "primary":
@@ -308,7 +374,9 @@ class MeshtasticTransport:
         if destination is not None:
             kwargs["destinationId"] = destination
         try:
-            await blocking_call(self.interface.sendText, text, **kwargs)
+            packet = await blocking_call(self.interface.sendText, text, **kwargs)
+            packet_id = getattr(packet, 'id', None)
+            return packet_id if type(packet_id) is int else None
         except asyncio.CancelledError:
             # Cancelling an await cannot retract a running SDK send. Prevent
             # subsequent sends from overlapping it and let management close
@@ -368,3 +436,4 @@ class MeshtasticTransport:
             self.interface = None
         if self.status != "failed":
             self.status = "stopped"
+        log_event(log, logging.INFO, 'radio_closed', status=self.status)

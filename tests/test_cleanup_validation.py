@@ -1,5 +1,4 @@
 import asyncio
-import json
 import sqlite3
 import subprocess
 import sys
@@ -264,11 +263,13 @@ class CheckExitStatusTests(unittest.TestCase):
                 result = subprocess.run([sys.executable, "mesh_bot.py", "--config", str(root / "bot.toml"), "--check"],
                     cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn(error, result.stderr)
-                health = json.loads(result.stdout.splitlines()[-1])
-                self.assertEqual(health["transport"]["status"], "stopped")
-                self.assertEqual(health["plugins"]["broken"]["status"], "failed")
-                self.assertEqual(health["plugins"]["healthy"]["status"], "stopped")
+                if error == 'release failed':
+                    self.assertIn('error_type=OSError', result.stderr)
+                else:
+                    self.assertIn(error, result.stderr)
+                self.assertIn('transport_final_state status=stopped', result.stderr)
+                self.assertIn('plugin_final_state plugin=broken status=failed', result.stderr)
+                self.assertIn('plugin_final_state plugin=healthy status=stopped', result.stderr)
                 with sqlite3.connect(root / "data/core.db") as database:
                     self.assertEqual(database.execute(
                         'SELECT value FROM state WHERE plugin=? AND key=?', ("healthy", "cleaned")).fetchone(),
