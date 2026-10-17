@@ -1,20 +1,28 @@
 # Linux service installation
 
 The installer supports Debian 12+, Ubuntu 24.04+, and Raspberry Pi OS Bookworm+
-with systemd and Python 3.11 or newer. It installs OS dependencies through apt
-and Python dependencies into a virtual environment. Network access to configured
+with systemd and **system Python 3.11 or newer already available to run the wizard**.
+The launcher performs no early package bootstrapping. If Python is missing or too
+old, it exits without changing the host; provision a supported system Python first.
+After approval, it installs OS dependencies through apt and Python dependencies
+into a virtual environment. Network access to configured
 apt and Python package repositories is required.
 
 Check out the repository wherever you want, then run:
 
 ```sh
-sudo bash /path/to/not-meshing-around/install.sh
+bash /path/to/not-meshing-around/install.sh
 ```
 
-When already root, omit `sudo`. The current working directory does not matter.
+The wizard can plan a fresh installation without root. After approval it asks
+for sudo authentication once and executes the approved plan as root. Running
+with `sudo bash ...` or directly as root is also supported. Planning an existing
+private installation may require starting with sudo so its configuration is
+readable. The current working directory does not matter.
 The installer locates its files relative to its own checkout and copies the
 runtime into the chosen destination; it does not move the checkout or change
-Git's global configuration.
+Git's global configuration. Execute the launcher; sourcing it is rejected,
+and its directory handling does not change the caller's shell directory.
 
 It asks for:
 
@@ -24,6 +32,30 @@ It asks for:
 4. TCP or serial radio connection.
 5. TCP hostname/IP and port (defaults `localhost`, `4403`), or the serial device
    (default `/dev/ttyACM0`; a stable `/dev/serial/by-id/...` path is preferable).
+
+All prompts and read-only validation finish before the installation summary.
+The summary identifies the destination, account, radio endpoint, plugin/data
+paths, service, preserved/replaced files, dependency changes, and log locations.
+`Proceed with install? [y/N]` defaults to **No**. Declining or reaching EOF during
+planning creates no files, logs, accounts, or package/service changes. No sudo
+request occurs before approval when planning unprivileged.
+
+The dependency preview lists these direct OS requirements:
+`python3 python3-venv ca-certificates acl passwd util-linux`. It distinguishes
+already-installed requirements and displays the complete simulated APT
+install/upgrade transaction, including supporting packages and versions. Use
+`--verbose` to include APT's complete simulation output. Planning uses the existing
+package cache, no locks/downloads, and never runs `apt-get update`. If that cache
+cannot resolve dependencies, the summary explicitly marks the preview incomplete.
+After approval, the installer refreshes metadata and simulates again. A changed
+transaction is displayed and requires a second approval before package installation;
+`--yes`/noninteractive execution stops instead and asks you to rerun against the
+refreshed cache. No full system upgrade, package removal, or autoremove is run.
+
+Python requirements are listed separately: **Meshtastic Python client library**
+(`meshtastic`) and `PyPubSub`, plus the supporting dependencies pip resolves.
+These are venv packages; this does not install another `meshtasticd`. The operation
+log records pip's resolved installed package versions.
 
 TCP can connect to a network radio or an existing Meshtastic daemon. The installer
 does not install or require `meshtasticd`. Console input is intended for interactive
@@ -35,8 +67,52 @@ For a preview that makes no changes:
 sudo bash install.sh --dry-run
 ```
 
-The preview requires Python 3.11+ to be installed already. A real install can
-bootstrap Python and venv support from apt on supported releases.
+Preview is also available without prompts:
+
+```sh
+bash install.sh --dry-run --non-interactive --install-dir /opt/meshbot
+```
+
+Every wizard parameter has a command-line equivalent: `--install-dir`,
+`--service-user`, `--service-group`, `--radio-type tcp|serial`, `--radio-host`,
+`--radio-port`, and `--serial-device`. Supplied values replace their prompts.
+`--non-interactive` uses supplied values and existing/default values for the rest;
+it requires explicit `--yes` (`-y`) except with `--dry-run`.
+
+```sh
+bash install.sh --non-interactive --yes --install-dir /opt/meshbot \
+  --service-user meshbot --service-group meshbot \
+  --radio-type tcp --radio-host localhost --radio-port 4403
+```
+
+`--yes` approves the displayed plan but does not waive changed-dependency checks.
+Use `bash install.sh --help` for all options. A running systemd host is required
+for execution; a dry run can also inspect the layout in a Debian-based container.
+
+## Progress and installer logs
+
+After approval, the terminal shows ASCII progress across named stages. Detailed
+apt, venv/pip, validation, and service output goes to a timestamped root-only file:
+
+```text
+/var/log/meshbot/install-YYYYMMDD-HHMMSS-ffffff.log
+/var/log/meshbot/uninstall-YYYYMMDD-HHMMSS-ffffff.log
+```
+
+Log directories use mode `0700`, log files `0600`, and existing logs are retained.
+Each log records installer version, OS/architecture, approved parameters and
+APT transaction, phase/command output and exit status, removal actions, and the
+final result. Logs use local timestamps with timezone offsets. Redirected terminal
+output receives timestamped stage lines without animation. A failure shows the
+recent log excerpt and full log path, then exits unsuccessfully. Ctrl+C/SIGTERM
+interrupt execution and are recorded; active command groups are terminated.
+Configuration contents and environment variables are not dumped. Recognizable
+password/key/token assignments, authorization headers, and URL credentials are
+redacted from commands, output, and failure excerpts. Treat these operational
+logs as sensitive even with redaction.
+
+Installer logs are separate from application journald/syslog output. They remain
+after uninstall and purge. No logs are created for declined plans or dry runs.
 
 ## Files, accounts, and permissions
 
@@ -74,7 +150,7 @@ is easier to update with normal Git commands.
 
 For installer-managed layouts, `core.plugins` and `core.database` must resolve
 inside the installation directory. The database needs a separate data directory
-outside the core, plugins, installer, and venv trees. Installer-managed trees must
+outside the core, plugins, installer, and venv, docs, and cache trees. Installer-managed trees must
 not contain symlinks; the venv's normal interpreter/library symlinks are handled
 without changing the files they point to.
 
@@ -127,4 +203,51 @@ The existing service is stopped before updating its executable files. Failed
 checks or dependency installs stop the installer without claiming success; a
 previous service may remain stopped until the problem is fixed and installation
 is rerun. Runtime files are not rolled back automatically, and accounts or existing
-data are never deleted by this installer. It manages one `meshbot.service` per host.
+data are retained during installation. It manages one `meshbot.service` per host.
+
+
+## Uninstall and purge
+
+Run the installer from your checkout (or its installed copy):
+
+```sh
+bash install.sh --uninstall --dry-run
+bash install.sh -u
+bash install.sh --uninstall --purge
+```
+
+Uninstall discovers the installation from root-owned metadata, displays its
+removal/preservation summary, and defaults confirmation to No. It stops and
+disables `meshbot.service`, removes the managed unit, reloads systemd, removes
+unchanged inventoried runtime files plus venv/cache, and verifies service removal.
+The inventory lives at `/var/lib/meshbot-installer/installation.json`, outside the
+service-owned tree. It records file hashes, paths, account creation information,
+package transaction/pre-existing requirements, runtime digest, and installation
+status. It is written before deployment so interrupted installs remain removable.
+The service-owned `.meshbot-install.json` remains only a reinstall/defaults marker;
+it does not authorize root file deletion.
+
+Ordinary uninstall preserves:
+
+- `bot.toml` and configuration backups;
+- the full plugin directory, including custom plugins and settings;
+- the configured data directory/database;
+- modified runtime files and unknown files;
+- system accounts/groups, traversal ACLs, OS packages, and installer logs.
+
+`--purge` must accompany `--uninstall`. It adds removal of `bot.toml`, its installer
+backups, the entire recorded plugin directory, and the entire recorded data
+directory. This includes custom plugins and stored data; inspect the summary
+before approving. Other unknown/modified files and Git history remain, so the
+installation root may remain. Shared system packages, accounts, and ACLs are
+never automatically removed, even with purge. The root-owned inventory and logs
+are retained for diagnostics. Reinstall into the same directory can reuse
+preserved settings; choosing another directory requires purging the prior
+recorded installation first.
+
+For installations made before inventory support, `--uninstall` offers **service
+removal only** and retains every installation file. `--purge` is refused without
+a trusted inventory. Rerun the new installer at the existing destination first
+if you want full inventoried removal. An unrelated service, untrusted metadata,
+or redirected installation path is rejected. Removal walks opened directories
+without following symlinks, and modified files are retained rather than guessed.
