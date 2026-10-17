@@ -32,17 +32,21 @@ Use `--config /path/to/local.toml` for a separate configuration file.
 
 ## Install as a Linux service
 
-On Debian/Ubuntu or Raspberry Pi OS with systemd:
+On supported Debian/Ubuntu or Raspberry Pi OS releases with systemd and system Python 3.11+:
 
 ```sh
 sudo bash install.sh
 ```
 
 The installer asks for the installation directory (default `/opt/meshbot`), system
-group/user (both default `meshbot`), and TCP or serial radio settings. It installs
-dependencies, creates the venv and dedicated account, and enables and starts
-`meshbot.service`. The checkout can live anywhere. See the
-[installation guide](docs/install.md) for supported releases, previews, and updates.
+group/user (both default `meshbot`), and TCP or serial radio settings. It shows a
+bot/dependency summary and asks for approval before changing the host. Execution
+uses quiet stage progress and root-only logs under `/var/log/meshbot/`, installs
+dependencies and the venv, and enables/starts `meshbot.service`. The checkout can
+live anywhere. `--dry-run` previews without changes; `-u`/`--uninstall` removes the
+service/runtime while preserving configuration, plugins, and data. Add `--purge`
+to explicitly remove those too. See the [installation guide](docs/install.md)
+for dependencies, previews, automation, updates, and uninstall details.
 
 ## Architecture
 
