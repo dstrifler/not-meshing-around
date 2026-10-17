@@ -121,9 +121,10 @@ class PingTests(unittest.IsolatedAsyncioTestCase):
         for index, (response, message) in enumerate(self.services.sent, 1):
             self.assertIn(f'Reply {index}/3.', response.text)
             self.assertIn('Tag: #Road test.', response.text)
-            self.assertEqual(response.destination, 'private')
+            self.assertEqual(response.destination, 'reply')  # Core selects the audience.
             self.assertEqual((message.sender, message.channel, message.interface), (123, 2, 'secondary'))
         self.assertEqual(self.services.state['requests'], 1)
+        self.assertEqual(self.registration.routing.reply_mode, 'dm')
 
     async def test_stop_is_scoped_and_cancels_future_replies(self):
         await self.request(arguments='3')
@@ -164,6 +165,7 @@ class PingTests(unittest.IsolatedAsyncioTestCase):
         await self.tick(20)
         response, message = self.services.sent[0]
         self.assertEqual(response.destination, 'reply')
+        self.assertEqual(self.registration.routing.reply_mode, 'origin')
         self.assertFalse(message.direct)
         self.assertEqual(message.channel, 3)
 

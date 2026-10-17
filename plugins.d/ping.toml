@@ -1,12 +1,16 @@
 [plugin]
 id = "ping"
-version = "1.2.0"
+version = "1.3.0"
 api_version = 1
 enabled = true
 
+[routing]
+listen_mode = "both"
+# Omit channels to accept all indexes 0-7; [] disables channel commands.
+reply_mode = "dm"
+
 [settings]
 reply = "🏓 Pong."
-reply_privately = true
 show_noise_floor = false
 interval_seconds = 20
 max_count = 50
