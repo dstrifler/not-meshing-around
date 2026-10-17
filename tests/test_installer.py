@@ -372,6 +372,36 @@ class InstallerFlowTests(unittest.TestCase):
         self.assertTrue((self.prefix / 'scripts/install.py').is_file())
         self.assertEqual(installer.read_config(self.prefix / 'bot.toml')['radio']['hostname'], 'radio.local')
 
+    def test_completed_install_keeps_the_directory_where_the_installer_started(self):
+        starting = self.root / 'checkout working directory'
+        starting.mkdir()
+        with contextlib.chdir(starting):
+            self.install()
+            self.assertEqual(Path.cwd(), starting)
+            self.assertTrue((self.prefix / 'venv/bin/python').exists())
+            self.assertEqual(list(starting.iterdir()), [])
+
+    def test_failed_and_cancelled_installs_keep_the_starting_directory(self):
+        starting = self.root / 'checkout working directory'
+        starting.mkdir()
+        with contextlib.chdir(starting):
+            self.fail_pip = True
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.install()
+            self.assertEqual(Path.cwd(), starting)
+            self.fail_pip = False
+
+            def interrupt(*args, **kwargs):
+                if 'pip' in args and 'install' in args:
+                    raise KeyboardInterrupt()
+                return self.command_stub(*args, **kwargs)
+
+            with patch.object(installer, 'run', side_effect=interrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.install()
+            self.assertEqual(Path.cwd(), starting)
+            self.assertEqual(list(starting.iterdir()), [])
+
     def test_execution_creates_separate_install_and_uninstall_logs(self):
         plan = {'action': 'install', 'options': installer.asdict(self.options) | {'prefix': str(self.prefix)},
                 'config': installer.dump_config(installer.read_config(ROOT / 'bot.toml')),

@@ -23,6 +23,10 @@ The installer locates its files relative to its own checkout and copies the
 runtime into the chosen destination; it does not move the checkout or change
 Git's global configuration. Execute the launcher; sourcing it is rejected,
 and its directory handling does not change the caller's shell directory.
+For example, starting the installer from `~/not-meshing-around` and choosing
+`/opt/meshbot` leaves you in `~/not-meshing-around` when it finishes, fails, or
+is cancelled. Venv and pip commands use the destination as their own working
+directory without changing the installer's starting directory.
 
 It asks for:
 
